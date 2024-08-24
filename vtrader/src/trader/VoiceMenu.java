@@ -800,7 +800,7 @@ class VoiceMenu  implements APICallback{
 			json.put("bars", getJSONBars(instruments.get(selectedInstrument).getInstrument(), 1l, Period.ONE_HOUR));
 		} catch (JSONException e1) {
 			e1.printStackTrace();
-			speak("error");
+			speak("Error");
 			return;
 		}
 		new Thread(new JSONSender(this, json)).run();
