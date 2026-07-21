@@ -3,6 +3,7 @@ import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.io.File;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -47,11 +48,15 @@ class VoiceMenu  implements APICallback{
 	private static final int TYPE_NONE = 0;
 	private static final int TYPE_BUY = 1;
 	private static final int TYPE_SELL = 2;
+	private static final int TYPE_HEDGE = 3;
 
 	private List<MyInstrument> instruments ;
 	private int selectedInstrument = 0;
 	private String op = "instrument";
 	private int openType = TYPE_NONE;
+	boolean isDirectionSelected;
+	private ITick initTick; // last tick before user presses F1
+	private double openPrice;
 	private int idx = 0;
 	private int rate = 25; // speech rate
 	private List<IOrder> openOrders;
@@ -97,17 +102,23 @@ class VoiceMenu  implements APICallback{
 				return false;
 			}
 
+			double sl = lastTick.getAsk() * instruments.get(selectedInstrument).slp / 100.0 / instruments.get(selectedInstrument).instrument.getLeverageUse();
+			double tp = lastTick.getAsk() * instruments.get(selectedInstrument).tpp / 100.0 / instruments.get(selectedInstrument).instrument.getLeverageUse();
+			
 			double slp;
 			double tpp;
 
 			if (order.isLong()) {
-				slp = lastTick.getAsk() - instruments.get(selectedInstrument).slp;
-				tpp = lastTick.getBid() +  instruments.get(selectedInstrument).tpp;
+				slp = lastTick.getAsk() - sl;
+				tpp = lastTick.getBid() +  tp;
 			} 
 			else {
-				slp = lastTick.getBid() + instruments.get(selectedInstrument).slp;
-				tpp = lastTick.getAsk() - instruments.get(selectedInstrument).tpp;
+				slp = lastTick.getBid() + sl;
+				tpp = lastTick.getAsk() - tp;
 			}
+			double pip = instruments.get(selectedInstrument).instrument.getPipValue();
+			slp = Math.round(slp /pip)*pip;
+			tpp = Math.round(tpp /pip)*pip;
 			speak("Updating SL and TP");
 			try {
 				order.setStopLossPrice(slp);
@@ -138,14 +149,55 @@ class VoiceMenu  implements APICallback{
 		}
 	}
 	private String formatPrice(double price) {
-		return formatPrice(price, false);
+		return formatPrice(price, false, null);
 	}
-	private String formatPrice(double price, boolean shorter) {
-		String s = String.valueOf(price);
-		if (shorter)
-			s = s.replaceFirst(".*(\\d)(\\d\\d)\\.(\\d)(\\d).*", "$1 $2 dot $3");
-		else
+	private String formatPrice(double price, boolean shorter, MyInstrument instrument) {
+		int skipDigits = 2;
+		int digits = 3;
+		if (instrument != null) {
+			if (instrument.dName.equals("USA500.IDX/USD"))
+				skipDigits = 1;
+		}
+		String s;
+		
+		if (shorter) {
+			s = String.valueOf(price + 0.0000001);
+			// keep only digits
+			s = s.replaceFirst("\\D", "");
+			String re = String.format("^(\\d{%d})(\\d{%d}).*", skipDigits, digits);
+			s = s.replaceFirst(re, "$2");
+			// add space
+			s = s.replaceFirst("^(\\d*)(\\d{2})$", "$1 $2");
+			s = s.replaceFirst("^(\\d*)(\\d{2})\\.", "$1 $2.");
+		}
+		else {
+			s = String.valueOf(price);
+			//s = s.replaceFirst("(\\d)(\\d\\d\\d)\\.", "$1, $2.");
+		}
+		
+		return s;
+	}
+	private String del_formatPrice(double price, boolean shorter) {
+
+		// scale the price to a higher range if necessary
+		if (shorter) {
+			if (price < 50)
+				price *= 10000;
+			else if (price < 500)
+				price *= 100;
+		}
+		
+		String s;
+		
+		if (shorter) { 
+			//s = s.replaceFirst(".*(\\d)(\\d\\d)\\.(\\d)(\\d).*", "$1 $2 dot $3");
+			s = String.valueOf(price + 0.00001);
+			s = s.replaceFirst(".*(\\d)(\\d{2})\\.(\\d)(\\d).*", "$1 $2 dot $3");
+		}
+		else {
+			s = String.valueOf(price);
 			s = s.replaceFirst("(\\d)(\\d\\d\\d)\\.", "$1, $2.");
+		}
 		// is it a round number?
 		s = s.replaceFirst("\\.0+$", "");
 		return s;
@@ -162,25 +214,27 @@ class VoiceMenu  implements APICallback{
 
 		return p / 1e10;
 	}
-	private double getPrice(Instrument instrument, boolean bid) {
+	private ITick getLastTick(Instrument instrument) {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait.");
-			return 0;
+			return null;
 		}
 
 		IHistory history = MyStrategy.getContext().getHistory();
-		double price;
+		ITick tick = null;
 		try {
-			ITick tick = history.getLastTick(instrument);
-			if (bid)
-				price = tick.getBid();
-			else
-				price = tick.getAsk();
-		} catch (JFException e) {
+			tick = history.getLastTick(instrument);
+			} catch (JFException e) {
 			speak("Error getting price");
-			price = 0;
 		}
-		return price;
+		return tick;
+	}
+	private double getPrice(Instrument instrument, boolean bid) {
+		ITick tick = getLastTick(instrument);
+		if (bid)
+			return tick.getBid();
+		else
+			return tick.getAsk();
 	}
 	private int getLabelId() {
 		File file = new File(Main.baseDir, "my_config" + Main.separator + "last_label_id.txt");
@@ -233,13 +287,19 @@ class VoiceMenu  implements APICallback{
 					reportInstrument();
 					break;
 				case  KeyEvent.VK_2:
-					reportPrice(TYPE_SELL, false);
+					reportPrice(TYPE_SELL, false, instruments.get(selectedInstrument));
 					break;
 				case  KeyEvent.VK_LEFT:
-					reportPrice(TYPE_SELL, true);
+					if (op.equals("open") && !isDirectionSelected)
+						adjustOpenPrice(-1);
+					else
+						reportPrice(TYPE_SELL, true, instruments.get(selectedInstrument));
 					break;
 				case  KeyEvent.VK_RIGHT:
-					reportPrice(TYPE_BUY, true);
+					if (op.equals("open") && !isDirectionSelected)
+						adjustOpenPrice(1);
+					else
+					reportPrice(TYPE_BUY, true, instruments.get(selectedInstrument));
 					break;
 				case  KeyEvent.VK_3:
 					op = "slp";
@@ -281,7 +341,7 @@ class VoiceMenu  implements APICallback{
 						op = "update_sl_tp";
 						IOrder order = openOrders.get(idx);
 						speak(String.format(
-								"Update stop loss and take profit of %s order %s, to: %s, and %s? Press space to confirm.",
+								"Update stop loss and take profit of %s order %s, to: %s%%, and %s%%? Press space to confirm.",
 								(order.isLong()) ? "buy" : "sell",
 										order.getLabel(),
 										formatPrice(instruments.get(selectedInstrument).slp),
@@ -298,6 +358,10 @@ class VoiceMenu  implements APICallback{
 				case  KeyEvent.VK_F1:
 					op = "open";
 					openType = TYPE_NONE;
+					initTick = getLastTick(instruments.get(selectedInstrument).getInstrument());
+					openPrice = (initTick.getAsk() + initTick.getBid()) /2;
+					isDirectionSelected = false;
+					
 					speak("Open new position");
 					break;
 				case  KeyEvent.VK_SHIFT:
@@ -324,10 +388,20 @@ class VoiceMenu  implements APICallback{
 					speak("");
 					break;
 				case  KeyEvent.VK_F5:
-					reportHistory();
+					reportHistory(Period.FIVE_MINS);
 					break;
 				case  KeyEvent.VK_F6:
+					reportHistory(Period.ONE_HOUR);
+					break;
+				case  KeyEvent.VK_F7:
 					reportPeaks();
+					break;
+				case  KeyEvent.VK_F9:
+					if (op.equals("open")) {
+						openType = TYPE_HEDGE;
+						isDirectionSelected = false;
+						speak("Hedging mode");
+					}
 					break;
 				case  KeyEvent.VK_F12:
 					speak(MyUtils.formatTime(System.currentTimeMillis()));
@@ -350,12 +424,35 @@ class VoiceMenu  implements APICallback{
 			reportInstrument();
 		}
 		else if (op.equals("slp")) {
-			instruments.get(selectedInstrument).slp = increasePrice(instruments.get(selectedInstrument).slp, direction);
+			double slp = instruments.get(selectedInstrument).slp;
+			double x = slp + direction / 10.0;
+			if (x < 5)
+				direction *= 2;
+			else
+				direction *= 5;
+			if (x >= 10)
+				direction *= 2;
+			slp = Math.round(slp*10 + direction) / 10.0;
+			slp = Math.max(1, Math.min(100, slp));
+			instruments.get(selectedInstrument).slp  = slp;
+			
 			speak(formatPrice(instruments.get(selectedInstrument).slp));
 		}
 		else if (op.equals("tpp")) {
-			instruments.get(selectedInstrument).tpp = increasePrice(instruments.get(selectedInstrument).tpp, direction);
+			double tpp = instruments.get(selectedInstrument).tpp;
+			double x = tpp + direction / 10.0;
+			if (x < 5)
+				direction *= 2;
+			else
+				direction *= 5;
+			if (x >= 10)
+				direction *= 2;
+			tpp = Math.round(tpp*10 + direction) / 10.0;
+			tpp = Math.max(1, Math.min(100, tpp));
+			instruments.get(selectedInstrument).tpp  = tpp;
+			
 			speak(formatPrice(instruments.get(selectedInstrument).tpp));
+
 		}
 		else if (op.equals("quantity")) {
 			if (instruments.get(selectedInstrument).quantity  < 10)
@@ -374,7 +471,8 @@ class VoiceMenu  implements APICallback{
 			IOrder order = openOrders.get(idx);
 			double profit = Math.round((order.getProfitLossInAccountCurrency() + 2 * order.getCommission()) * 100) / 100.0;
 			speak(String.format(
-					"%s, profit: %s, %s, %d x, %s, open price: %s, time: %s",
+					"%s %s, profit: %s, %s, %d x, %s, open price: %s, time: %s",
+					order.getFillHistory().isEmpty() ? "*" : "",
 					order.getLabel(),
 					formatPrice(profit),
 					(order.isLong()) ? "buy" : "sell",
@@ -392,7 +490,18 @@ class VoiceMenu  implements APICallback{
 			if (idx <0) 
 				idx = 0;
 			IReportPosition position = closedOrders.get(idx);
-			double profit = Math.round((position.getProfitLoss().getAmount() + position.getCommission().getAmount()) *100) / 100.0;
+			// exchange rate to account currency
+			double r = 1;
+			try {
+				r = MyStrategy.getContext().getUtils().getRate(
+						position.getProfitLoss().getJFCurrency(),
+						MyStrategy.getContext().getAccount().getAccountCurrency() 
+				);
+			} catch (JFException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			double profit = Math.round((position.getProfitLoss().getAmount() * r + position.getCommission().getAmount()) *100) / 100.0;
 			speak(String.format(
 					"%s, profit: %s, %d x, %s, open price: %s, close price: %s, closing time: %s",
 					MyUtils.formatDateTimeShort(position.getOpenTime()),
@@ -414,6 +523,7 @@ class VoiceMenu  implements APICallback{
 		}
 		else if (op.equals("open")) {
 			openType = (direction == 1) ? TYPE_BUY : TYPE_SELL;
+			isDirectionSelected = true;
 			reportOrderRequest();
 		}
 		else if (op.equals("voice")) {
@@ -436,10 +546,10 @@ class VoiceMenu  implements APICallback{
 				instruments.get(selectedInstrument).instrument.isTradable() ? "Tradable" : "non tradable"
 				));
 	}
-	private void reportPrice(int type, boolean shorter) {
+	private void reportPrice(int type, boolean shorter, MyInstrument instrument) {
 		if (MyStrategy.getContext() != null) {
 			double price = getPrice(instruments.get(selectedInstrument).getInstrument(), type == TYPE_SELL);
-			speak(formatPrice(price, shorter));
+			speak(formatPrice(price, shorter, instrument));
 		}
 		else {
 			speak("Please wait.");
@@ -448,11 +558,11 @@ class VoiceMenu  implements APICallback{
 	}
 	private void reportSLP() {
 		double slp = instruments.get(selectedInstrument).slp;
-		speak(String.format("Stop loss %s", formatPrice(slp)));
+		speak(String.format("Stop loss %s%%", formatPrice(slp)));
 	}
 	private void reportTPP() {
 		double tpp = instruments.get(selectedInstrument).tpp;
-		speak(String.format("Take profit %s", formatPrice(tpp)));
+		speak(String.format("Take profit %s%%", formatPrice(tpp)));
 	}
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
@@ -473,10 +583,9 @@ class VoiceMenu  implements APICallback{
 	private void reportOrderRequest() {
 		MyInstrument instrument = instruments.get(selectedInstrument);
 		String direction = (openType == TYPE_BUY) ? "buy" : "sell"; 
-		speak(String.format("%s, %d x %s, risk: %s, stop loss: %s, take profit: %s, Press space to confirm.",
+		speak(String.format("%s, %d x %s, stop loss: %s%%, take profit: %s%%, Press space to confirm.",
 				direction, 
 				instrument.quantity,  instrument.name,
-				formatPrice(Math.round(instrument.quantity * instrument.slp)),
 				formatPrice(instrument.slp), formatPrice(instrument.tpp) 
 				));
 	}
@@ -491,9 +600,20 @@ class VoiceMenu  implements APICallback{
 				speak("non tradable");
 				return;
 			}
-			int direction = (openType == TYPE_BUY) ? Command.OPERATION_BUY : Command.OPERATION_SELL;
 			int labelId  = getLabelId();
-			new Command(instrument.getDShortName(), direction, instrument.slp, instrument.tpp, instrument.quantity, "B" + labelId).execute();;
+			// use market price if no price is set
+			if (openPrice < initTick.getAsk() && openPrice > initTick.getBid())
+				openPrice = 0;
+			double slp = initTick.getAsk() * instrument.slp / 100.0 / instrument.instrument.getLeverageUse();
+			double tpp = initTick.getAsk() * instrument.tpp / 100.0 / instrument.instrument.getLeverageUse();
+			int direction;
+			if (openType == TYPE_HEDGE)
+				direction = Command.OPERATION_HEDGE;
+			else if (openType == TYPE_BUY)
+				direction = Command.OPERATION_BUY;
+			else
+				direction = Command.OPERATION_SELL;
+			new Command(instrument.getDShortName(), direction, slp, tpp, instrument.quantity, "B" + labelId, openPrice).execute();
 		}
 		else if (op.equals("close_order")) {
 			IOrder order = openOrders.get(idx);
@@ -576,21 +696,22 @@ class VoiceMenu  implements APICallback{
 			speak("Not connected");
 		}
 	}
-	private void reportHistory() {
+	private void reportHistory(Period period) {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait");
 			op = "";
 			return;
 		}
-		speak("History, loading");
-		IBar lastBar;
+		speak("History of lows and highs, loading");
+		
 		List<IBar>  bars;
 		try {
-			lastBar = MyStrategy.getContext().getHistory().getBar(instruments.get(selectedInstrument).getInstrument(), Period.FIVE_MINS ,OfferSide.ASK, 0);
-			bars = MyStrategy.getContext().getHistory().getBars(
-					instruments.get(selectedInstrument).getInstrument(),
-					Period.FIVE_MINS ,OfferSide.ASK, 
-					lastBar.getTime() -24*3600*1000, lastBar.getTime());
+			IHistory history = MyStrategy.getContext().getHistory();
+			Instrument x = instruments.get(selectedInstrument).getInstrument();
+			long prevBarTime = history.getPreviousBarStart(period, history.getLastTick(x).getTime());
+			long startTime =  history.getTimeForNBarsBack(period, prevBarTime, 100);
+			//long startTime =  prevBarTime - 3*24*3600*1000;
+			bars = history.getBars(x, period, OfferSide.ASK, startTime, prevBarTime);
 		} catch (JFException e) {
 			// TODO Auto-generated catch block
 			e.printStackTrace();
@@ -600,12 +721,10 @@ class VoiceMenu  implements APICallback{
 		}
 		textList.clear();
 		for (int i = 0; i < bars.size(); i++) {
-			String high = formatPrice(Math.round(bars.get(i).getHigh()), false);
-			high = high.substring(high.length()-3);
 			textList.add(String.format(
-					"%s: %s: at %s",
-					formatPrice(Math.round(bars.get(i).getLow()), false),
-					high,
+					"%s: %s: till %s",
+					formatPrice(bars.get(i).getLow(), true, instruments.get(selectedInstrument)),
+					formatPrice(bars.get(i).getHigh(), true, instruments.get(selectedInstrument)),
 					MyUtils.formatTime(bars.get(i).getTime())
 					));
 		}
@@ -650,35 +769,43 @@ class VoiceMenu  implements APICallback{
 		Peak out2 = fp.detectTroughs();
 		int[] troughs = out2.filterByProminence(lastTick.getBid() * 0.0010, 1000000.0);
 
+		double pip = instruments.get(selectedInstrument).instrument.getPipValue();
+		
 		// combine them
 		Map<Long, String> all = new TreeMap<>(); 
 		for (int i: peaks) {
+			signal[i]  = Math.round(signal[i]/pip)*pip;
+			// remove trailing zeros which sometime apears
+			signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
+
 			String value;
 			if (signal[i] > 1000)
-				value = formatPrice(Math.round(signal[i]));
+				value = formatPrice(Math.round(signal[i])).replaceAll("..$", ""); 
 			else
 				value = formatPrice(signal[i]);
 			String s = String.format(
-					"Max: %s. at %s. %s",
-					value.substring(value.length()-3),
-					MyUtils.formatTime(ticks.get(i).getTime()),
-					value
+					"Max: %s. at %s",
+					//value.substring(value.length()-3),
+					value,
+					MyUtils.formatTime(ticks.get(i).getTime())
 					);
 			all.put(ticks.get(i).getTime(), s);
 		}
 
 		for (int i: troughs) {
+			signal[i]  = Math.round(signal[i]/pip)*pip;
+			// remove trailing zeros which sometime apears
+			signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
 			String value;
 			if (signal[i] > 1000)
-				value = formatPrice(Math.round(signal[i]));
+				value = formatPrice(Math.round(signal[i])).replaceAll("..$", ""); 
 			else
 				value = formatPrice(signal[i]);
 
 			String s = String.format(
-					"Min: %s. at %s. %s",
-					value.substring(value.length()-3),
-					MyUtils.formatTime(ticks.get(i).getTime()),
-					value
+					"Min: %s. at %s",
+					value,
+					MyUtils.formatTime(ticks.get(i).getTime())
 					);
 			all.put(ticks.get(i).getTime(), s);
 		}
@@ -806,6 +933,22 @@ class VoiceMenu  implements APICallback{
 		new Thread(new JSONSender(this, json)).run();
 
 
+	}
+	private void adjustOpenPrice(int direction) {
+
+		double pip = instruments.get(selectedInstrument).instrument.getPipValue();
+		openPrice = openPrice * (1 + direction * 0.0002);
+		openPrice  = Math.round(openPrice  /pip)*pip;
+		// remove trailing zeros which sometime apears
+		openPrice   = Math.round(openPrice * 1000000) / 1000000.0;
+		System.out.println(openPrice);
+
+		if (openType == TYPE_HEDGE) {
+			speak("Hedging at " + openPrice);
+		}
+		else {
+			speak("Target price " + openPrice + ". Press up for buy, down for sell.");
+		}
 	}
 
 }
