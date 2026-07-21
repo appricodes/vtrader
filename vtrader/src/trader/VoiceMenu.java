@@ -8,6 +8,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -49,6 +51,7 @@ class VoiceMenu  implements APICallback{
 	private static final int TYPE_BUY = 1;
 	private static final int TYPE_SELL = 2;
 	private static final int TYPE_HEDGE = 3;
+	private static final int MAX_DAYS_BACK = 60; // ~2 months
 
 	private List<MyInstrument> instruments ;
 	private int selectedInstrument = 0;
@@ -58,6 +61,10 @@ class VoiceMenu  implements APICallback{
 	private ITick initTick; // last tick before user presses F1
 	private double openPrice;
 	private int idx = 0;
+	private int dayOffset = 0; // days back from today, used by F7 day browsing
+	private DayStats currentDayStats; // stats for the day currently selected under F7
+	private boolean shiftDown = false; // tracked manually: modifier bit on arrow-key events is unreliable on some setups
+	private boolean shiftUsedAsModifier = false; // true once Shift was combined with another key, to distinguish a plain Shift tap from Shift+arrow
 	private int rate = 25; // speech rate
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
@@ -260,6 +267,19 @@ class VoiceMenu  implements APICallback{
 		// Add a KeyListener to the text field
 		textField.addKeyListener(new KeyAdapter() {
 			@Override
+			public void keyReleased(KeyEvent e) {
+				if (e.getKeyCode() == KeyEvent.VK_SHIFT) {
+					shiftDown = false;
+					// a plain tap of Shift (not combined with another key) switches to messages, as before
+					if (!shiftUsedAsModifier) {
+						op = "messages";
+						idx = MyStrategy.messages.size() - 1;
+						reportMessage();
+					}
+					shiftUsedAsModifier = false;
+				}
+			}
+			@Override
 			public void keyPressed(KeyEvent e) {
 				//public void keyReleased(KeyEvent e) {
 				switch(e.getKeyCode()) {
@@ -292,14 +312,26 @@ class VoiceMenu  implements APICallback{
 				case  KeyEvent.VK_LEFT:
 					if (op.equals("open") && !isDirectionSelected)
 						adjustOpenPrice(-1);
-					else
-						reportPrice(TYPE_SELL, true, instruments.get(selectedInstrument));
+					else if (op.equals("days"))
+						speakDayMin();
+					else {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						reportPrice(TYPE_SELL, !shift, instruments.get(selectedInstrument));
+					}
 					break;
 				case  KeyEvent.VK_RIGHT:
 					if (op.equals("open") && !isDirectionSelected)
 						adjustOpenPrice(1);
-					else
-					reportPrice(TYPE_BUY, true, instruments.get(selectedInstrument));
+					else if (op.equals("days"))
+						speakDayMax();
+					else {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						reportPrice(TYPE_BUY, !shift, instruments.get(selectedInstrument));
+					}
 					break;
 				case  KeyEvent.VK_3:
 					op = "slp";
@@ -365,9 +397,7 @@ class VoiceMenu  implements APICallback{
 					speak("Open new position");
 					break;
 				case  KeyEvent.VK_SHIFT:
-					op = "messages";
-					idx = MyStrategy.messages.size() - 1;
-					reportMessage();
+					shiftDown = true;
 					break;
 				case  KeyEvent.VK_CAPS_LOCK:
 					processRate();
@@ -394,6 +424,15 @@ class VoiceMenu  implements APICallback{
 					reportHistory(Period.ONE_HOUR);
 					break;
 				case  KeyEvent.VK_F7:
+					if (MyStrategy.getContext() == null) {
+						speak("Please wait");
+						break;
+					}
+					op = "days";
+					dayOffset = 0;
+					reportDay();
+					break;
+				case  KeyEvent.VK_F8:
 					reportPeaks();
 					break;
 				case  KeyEvent.VK_F9:
@@ -512,6 +551,21 @@ class VoiceMenu  implements APICallback{
 					formatPrice(position.getClosePrice()),
 					MyUtils.formatTime(position.getCloseTime())
 					));
+		}
+		else if (op.equals("days")) {
+			int step = -direction;
+			DayStats stats;
+			boolean moved;
+			do {
+				int prevOffset = dayOffset;
+				int candidate = dayOffset + step;
+				candidate = Math.max(0, Math.min(MAX_DAYS_BACK, candidate));
+				dayOffset = candidate;
+				moved = dayOffset != prevOffset;
+				stats = computeDayStats(dayOffset);
+			} while (moved && stats.hasData && stats.minPrice == stats.maxPrice);
+			currentDayStats = stats;
+			speakDayStats(stats);
 		}
 		else if (op.equals("messages")) {
 			idx += direction;
@@ -732,6 +786,97 @@ class VoiceMenu  implements APICallback{
 		idx = textList.size() - 1;
 		speak("History ready");
 
+	}
+
+	private static class DayStats {
+		String dayName;
+		boolean hasData;
+		double minPrice;
+		long minTime;
+		double maxPrice;
+		long maxTime;
+	}
+
+	private DayStats computeDayStats(int offset) {
+		DayStats stats = new DayStats();
+		ZoneId zone = ZoneId.systemDefault();
+		ZonedDateTime dayStart = ZonedDateTime.now(zone).truncatedTo(ChronoUnit.DAYS).minusDays(offset);
+		stats.dayName = dayStart.format(DateTimeFormatter.ofPattern("MMMM d"));
+
+		Instrument instrument = instruments.get(selectedInstrument).getInstrument();
+		IHistory history = MyStrategy.getContext().getHistory();
+
+		long startTime = dayStart.toInstant().toEpochMilli();
+		long rawEndTime = Math.min(dayStart.plusDays(1).toInstant().toEpochMilli(), System.currentTimeMillis());
+
+		try {
+			// the current day's end time is "now", which falls mid-bar; align it to
+			// the start of the last completed 5 min bar, or getBars() rejects the interval
+			long endTime = history.getPreviousBarStart(Period.FIVE_MINS, rawEndTime);
+			if (endTime < startTime) {
+				stats.hasData = false;
+				return stats;
+			}
+			List<IBar> bars = history.getBars(instrument, Period.FIVE_MINS, OfferSide.ASK, startTime, endTime);
+			if (bars.isEmpty()) {
+				stats.hasData = false;
+				return stats;
+			}
+			IBar minBar = bars.get(0);
+			IBar maxBar = bars.get(0);
+			for (IBar bar : bars) {
+				if (bar.getLow() < minBar.getLow())
+					minBar = bar;
+				if (bar.getHigh() > maxBar.getHigh())
+					maxBar = bar;
+			}
+			stats.hasData = true;
+			stats.minPrice = minBar.getLow();
+			stats.minTime = minBar.getTime();
+			stats.maxPrice = maxBar.getHigh();
+			stats.maxTime = maxBar.getTime();
+		} catch (JFException e) {
+			e.printStackTrace();
+			stats.hasData = false;
+		}
+		return stats;
+	}
+
+	private void speakDayStats(DayStats stats) {
+		MyInstrument mi = instruments.get(selectedInstrument);
+		if (!stats.hasData) {
+			speak(stats.dayName + ". No data.");
+			return;
+		}
+		speak(String.format(
+				"%s. Min: %s at %s. Max: %s at %s.",
+				stats.dayName,
+				formatPrice(stats.minPrice, false, mi), MyUtils.formatTime(stats.minTime),
+				formatPrice(stats.maxPrice, false, mi), MyUtils.formatTime(stats.maxTime)
+				));
+	}
+
+	private void reportDay() {
+		currentDayStats = computeDayStats(dayOffset);
+		speakDayStats(currentDayStats);
+	}
+
+	private void speakDayMin() {
+		if (currentDayStats == null || !currentDayStats.hasData) {
+			speak("No data");
+			return;
+		}
+		MyInstrument mi = instruments.get(selectedInstrument);
+		speak(String.format("Min: %s at %s", formatPrice(currentDayStats.minPrice, false, mi), MyUtils.formatTime(currentDayStats.minTime)));
+	}
+
+	private void speakDayMax() {
+		if (currentDayStats == null || !currentDayStats.hasData) {
+			speak("No data");
+			return;
+		}
+		MyInstrument mi = instruments.get(selectedInstrument);
+		speak(String.format("Max: %s at %s", formatPrice(currentDayStats.maxPrice, false, mi), MyUtils.formatTime(currentDayStats.maxTime)));
 	}
 
 	private void reportPeaks() {
