@@ -345,6 +345,10 @@ class VoiceMenu  implements APICallback{
 					op = "quantity";
 					reportQuantity();
 					break;
+				case  KeyEvent.VK_6:
+					op = "risk";
+					reportRisk();
+					break;
 				case  KeyEvent.VK_F2:
 					reportOpenOrders();
 					break;
@@ -501,6 +505,29 @@ class VoiceMenu  implements APICallback{
 				instruments.get(selectedInstrument).quantity = 1;
 			speak(String.format("%d", instruments.get(selectedInstrument).quantity));
 		}
+		else if (op.equals("risk")) {
+			if (MyStrategy.getContext() == null) {
+				speak("Please wait.");
+			}
+			else {
+				MyInstrument instrument = instruments.get(selectedInstrument);
+				double slDistance = getStopLossDistance(instrument);
+				if (slDistance <= 0) {
+					speak("Please wait.");
+				}
+				else {
+					int percent = computeRiskPercent(instrument, slDistance);
+					percent += direction * 5;
+					percent = Math.max(5, Math.min(70, percent));
+					double balance = MyStrategy.getContext().getAccount().getBalance();
+					int newQuantity = (int) Math.round(balance * percent / 100.0 / slDistance);
+					if (newQuantity < 1)
+						newQuantity = 1;
+					instrument.quantity = newQuantity;
+					speak(String.format("Risk %d%%, quantity %d", percent, instrument.quantity));
+				}
+			}
+		}
 		else if (op.equals("open_orders")) {
 			idx += direction;
 			if (idx >= openOrders.size())
@@ -620,6 +647,37 @@ class VoiceMenu  implements APICallback{
 	}
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
+	}
+	// price distance from current ask to the configured stop loss level
+	private double getStopLossDistance(MyInstrument instrument) {
+		ITick tick = getLastTick(instrument.getInstrument());
+		if (tick == null)
+			return 0;
+		return tick.getAsk() * instrument.slp / 100.0 / instrument.instrument.getLeverageUse();
+	}
+	// derives the risk percent (rounded to the nearest 5%, 5-70) that the instrument's
+	// current quantity corresponds to, so quantity stays the single source of truth
+	private int computeRiskPercent(MyInstrument instrument, double slDistance) {
+		double balance = MyStrategy.getContext().getAccount().getBalance();
+		if (balance <= 0 || slDistance <= 0)
+			return 5;
+		double percent = instrument.quantity * slDistance / balance * 100.0;
+		int rounded = (int) (Math.round(percent / 5.0) * 5);
+		return Math.max(5, Math.min(70, rounded));
+	}
+	private void reportRisk() {
+		if (MyStrategy.getContext() == null) {
+			speak("Please wait.");
+			return;
+		}
+		MyInstrument instrument = instruments.get(selectedInstrument);
+		double slDistance = getStopLossDistance(instrument);
+		if (slDistance <= 0) {
+			speak("Please wait.");
+			return;
+		}
+		int percent = computeRiskPercent(instrument, slDistance);
+		speak(String.format("Risk %d%%, quantity %d", percent, instrument.quantity));
 	}
 	private void processRate() {
 		rate += 20;
