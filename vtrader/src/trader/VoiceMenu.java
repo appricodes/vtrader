@@ -61,6 +61,7 @@ class VoiceMenu  implements APICallback{
 	private static final int GUARANTEE_CONDITIONAL = 1;
 	private static final double GUARANTEE_SL_PERCENT = 2;
 	private static final double GUARANTEE_TP_PERCENT = 50;
+	private static final long GUARANTEE_RETRY_MS = 5000; // pause after the broker refuses a stop
 
 	private static VoiceMenu instance;
 
@@ -138,6 +139,8 @@ class VoiceMenu  implements APICallback{
 		double stopPrice;      // last stop we asked the broker for; only ever tightens
 		volatile boolean inFlight; // a modification is with the broker; do not send another
 		volatile boolean rejected; // a rejection was already announced for this streak
+		volatile boolean stopFailed; // last stop was refused; retry even when it looks no better
+		volatile long retryAfter; // do not send another modification before this time
 
 		ProfitGuarantee(IOrder order, boolean conditional, double triggerPrice) {
 			this.order = order;
@@ -160,25 +163,45 @@ class VoiceMenu  implements APICallback{
 
 		@Override
 		public Boolean call() {
+			boolean ok = true;
+			String label = guarantee.order.getLabel();
 			try {
-				if (!Double.isNaN(stop))
-					guarantee.order.setStopLossPrice(stop);
-				if (!Double.isNaN(stop) && !Double.isNaN(takeProfit))
-					MyUtils.sleep(2000);
-				if (!Double.isNaN(takeProfit))
-					guarantee.order.setTakeProfitPrice(takeProfit);
-				guarantee.rejected = false;
-				return true;
-			} catch (JFException e) {
-				e.printStackTrace();
-				// brokers enforce a minimum stop distance; without this the rejection would be
-				// announced again on every tick. stopPrice keeps the attempted value, so the next
-				// attempt only happens once the price has moved further in our favour.
-				if (!guarantee.rejected) {
-					guarantee.rejected = true;
-					speak("Broker rejected the guarantee stop loss on " + guarantee.order.getLabel());
+				// the take profit moves first. While it still sits at the user's price the broker can
+				// close the position there, and the guarantee would never get to trail - so it must not
+				// be skipped just because the stop was refused.
+				if (!Double.isNaN(takeProfit)) {
+					try {
+						guarantee.order.setTakeProfitPrice(takeProfit);
+					} catch (JFException e) {
+						e.printStackTrace();
+						ok = false;
+						speak("Could not move the take profit on " + label
+								+ ". The position can still close at its old target.");
+					}
+					if (!Double.isNaN(stop))
+						MyUtils.sleep(2000); // a second modification sent too soon is refused
 				}
-				return false;
+				if (!Double.isNaN(stop)) {
+					try {
+						guarantee.order.setStopLossPrice(stop);
+						guarantee.stopFailed = false;
+						guarantee.rejected = false;
+					} catch (JFException e) {
+						e.printStackTrace();
+						ok = false;
+						// 2% can fall inside the broker's minimum stop distance. stopPrice now holds a
+						// level the broker never accepted, so the usual "is this tighter" test would
+						// block every retry - stopFailed forces one, and retryAfter paces it.
+						guarantee.stopFailed = true;
+						guarantee.retryAfter = System.currentTimeMillis() + GUARANTEE_RETRY_MS;
+						if (!guarantee.rejected) {
+							guarantee.rejected = true;
+							speak("Broker refused the stop loss on " + label
+									+ ". The guarantee is not protecting yet. Set a stop loss by hand.");
+						}
+					}
+				}
+				return ok;
 			} finally {
 				guarantee.inFlight = false;
 			}
@@ -1463,7 +1486,7 @@ class VoiceMenu  implements APICallback{
 				profitGuarantees.remove(g);
 				continue;
 			}
-			if (g.inFlight)
+			if (g.inFlight || System.currentTimeMillis() < g.retryAfter)
 				continue;
 
 			if (!g.trailing) {
@@ -1483,9 +1506,10 @@ class VoiceMenu  implements APICallback{
 
 			double stop = guaranteeLevel(g.order, tick, GUARANTEE_SL_PERCENT, false);
 			// the stop only ever tightens - higher for a long, lower for a short. When the price moves
-			// against us the new level is worse than the one we hold, and we leave it alone.
+			// against us the new level is worse than the one we hold, and we leave it alone. After a
+			// refusal there is nothing holding at all, so retry regardless.
 			boolean better = g.order.isLong() ? stop > g.stopPrice : stop < g.stopPrice;
-			if (!better)
+			if (!better && !g.stopFailed)
 				continue;
 			g.stopPrice = stop;
 			submitGuarantee(g, stop, Double.NaN);
