@@ -1,0 +1,6 @@
+# runtime log output
+logs/
+*.log
+
+# written when baseDir is unset; order logs, not source
+null/
