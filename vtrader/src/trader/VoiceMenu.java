@@ -81,6 +81,8 @@ class VoiceMenu  implements APICallback{
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
 	private List<String> textList = new ArrayList<String>();
+	// full-precision counterpart of textList, spoken when a nav key is pressed with shift held
+	private List<String> textListFull = new ArrayList<String>();
 
 	class CloseOrderTask implements Callable<Boolean> {
 		IOrder order;
@@ -309,23 +311,27 @@ class VoiceMenu  implements APICallback{
 				//public void keyReleased(KeyEvent e) {
 				switch(e.getKeyCode()) {
 				case  KeyEvent.VK_UP:
-					processCursor(1);
-					break; 
 				case  KeyEvent.VK_DOWN:
-					processCursor(-1);
-					break;
 				case  KeyEvent.VK_PAGE_UP:
-					processCursor(10);
-					break;
 				case  KeyEvent.VK_PAGE_DOWN:
-					processCursor(-10);
-					break;
 				case  KeyEvent.VK_HOME:
-					processCursor(1000000000);
+				case  KeyEvent.VK_END: {
+					// shift held while navigating means "announce the full price instead of the short one"
+					boolean shift = shiftDown || e.isShiftDown();
+					if (shift)
+						shiftUsedAsModifier = true;
+					int step;
+					switch (e.getKeyCode()) {
+					case KeyEvent.VK_UP:        step = 1; break;
+					case KeyEvent.VK_DOWN:      step = -1; break;
+					case KeyEvent.VK_PAGE_UP:   step = 10; break;
+					case KeyEvent.VK_PAGE_DOWN: step = -10; break;
+					case KeyEvent.VK_HOME:      step = 1000000000; break;
+					default:                    step = -1000000000; break;
+					}
+					processCursor(step, shift);
 					break;
-				case  KeyEvent.VK_END:
-					processCursor(-1000000000);
-					break;
+				}
 				case  KeyEvent.VK_1:
 					// instrument selection
 					op = "instrument";
@@ -489,7 +495,7 @@ class VoiceMenu  implements APICallback{
 		frame.setVisible(true);
 
 	}
-	private void processCursor(int direction) {
+	private void processCursor(int direction, boolean shift) {
 		// instrument sellection
 		if (op.equals("instrument")) {
 			selectedInstrument += direction;
@@ -665,7 +671,10 @@ class VoiceMenu  implements APICallback{
 				idx = 0;
 			if (idx >= textList.size())
 				idx = textList.size() - 1;
-			speak(textList.get(idx));
+			if (shift && idx < textListFull.size())
+				speak(textListFull.get(idx));
+			else
+				speak(textList.get(idx));
 		}
 		
 	}
@@ -889,11 +898,18 @@ class VoiceMenu  implements APICallback{
 			return;
 		}
 		textList.clear();
+		textListFull.clear();
 		for (int i = 0; i < bars.size(); i++) {
 			textList.add(String.format(
 					"%s: %s: till %s",
 					formatPrice(bars.get(i).getLow(), true, instruments.get(selectedInstrument)),
 					formatPrice(bars.get(i).getHigh(), true, instruments.get(selectedInstrument)),
+					MyUtils.formatTime(bars.get(i).getTime())
+					));
+			textListFull.add(String.format(
+					"%s: %s: till %s",
+					formatPrice(bars.get(i).getLow(), false, instruments.get(selectedInstrument)),
+					formatPrice(bars.get(i).getHigh(), false, instruments.get(selectedInstrument)),
 					MyUtils.formatTime(bars.get(i).getTime())
 					));
 		}
@@ -994,6 +1010,14 @@ class VoiceMenu  implements APICallback{
 		speak(String.format("Max: %s at %s", formatPrice(currentDayStats.maxPrice, false, mi), MyUtils.formatTime(currentDayStats.maxTime)));
 	}
 
+	// the long form used by F8 only: for prices above 1000 the fractional part carries no
+	// useful information for a peak, so it is dropped; smaller prices (FX pairs) keep every digit.
+	// F5/F6 use plain formatPrice(x, false, ...) instead - this rounding is specific to peaks.
+	private String formatPeakPriceLong(double price) {
+		if (price > 1000)
+			return formatPrice(Math.round(price)).replaceAll("..$", "");
+		return formatPrice(price);
+	}
 	private void reportPeaks() {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait");
@@ -1031,46 +1055,49 @@ class VoiceMenu  implements APICallback{
 
 		double pip = instruments.get(selectedInstrument).instrument.getPipValue();
 		
-		// combine them
+		// combine them. Both maps are keyed by the same tick times, so the two lists stay
+		// index-aligned: plain cursor speaks the short price, shift speaks the full one.
+		MyInstrument mi = instruments.get(selectedInstrument);
 		Map<Long, String> all = new TreeMap<>(); 
+		Map<Long, String> allFull = new TreeMap<>(); 
 		for (int i: peaks) {
 			signal[i]  = Math.round(signal[i]/pip)*pip;
 			// remove trailing zeros which sometime apears
 			signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
 
-			String value;
-			if (signal[i] > 1000)
-				value = formatPrice(Math.round(signal[i])).replaceAll("..$", ""); 
-			else
-				value = formatPrice(signal[i]);
-			String s = String.format(
+			long time = ticks.get(i).getTime();
+			all.put(time, String.format(
 					"Max: %s. at %s",
-					//value.substring(value.length()-3),
-					value,
-					MyUtils.formatTime(ticks.get(i).getTime())
-					);
-			all.put(ticks.get(i).getTime(), s);
+					formatPrice(signal[i], true, mi),
+					MyUtils.formatTime(time)
+					));
+			allFull.put(time, String.format(
+					"Max: %s. at %s",
+					formatPeakPriceLong(signal[i]),
+					MyUtils.formatTime(time)
+					));
 		}
 
 		for (int i: troughs) {
 			signal[i]  = Math.round(signal[i]/pip)*pip;
 			// remove trailing zeros which sometime apears
 			signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
-			String value;
-			if (signal[i] > 1000)
-				value = formatPrice(Math.round(signal[i])).replaceAll("..$", ""); 
-			else
-				value = formatPrice(signal[i]);
 
-			String s = String.format(
+			long time = ticks.get(i).getTime();
+			all.put(time, String.format(
 					"Min: %s. at %s",
-					value,
-					MyUtils.formatTime(ticks.get(i).getTime())
-					);
-			all.put(ticks.get(i).getTime(), s);
+					formatPrice(signal[i], true, mi),
+					MyUtils.formatTime(time)
+					));
+			allFull.put(time, String.format(
+					"Min: %s. at %s",
+					formatPeakPriceLong(signal[i]),
+					MyUtils.formatTime(time)
+					));
 		}
 
 		textList = new ArrayList<String>(all.values());
+		textListFull = new ArrayList<String>(allFull.values());
 		op = "text_list";
 		idx = textList.size() - 1;
 		speak("Peaks ready");
