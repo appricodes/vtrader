@@ -136,8 +136,16 @@ class VoiceMenu  implements APICallback{
 				return false;
 			}
 
-			double sl = lastTick.getAsk() * instruments.get(selectedInstrument).slp / 100.0 / instruments.get(selectedInstrument).instrument.getLeverageUse();
-			double tp = lastTick.getAsk() * instruments.get(selectedInstrument).tpp / 100.0 / instruments.get(selectedInstrument).instrument.getLeverageUse();
+			// the percentages belong to the order's own instrument, not to whatever key 1 happens
+			// to point at - the two differ as soon as a position on another instrument is picked
+			MyInstrument mi = findMyInstrument(order.getInstrument());
+			if (mi == null) {
+				speak("No settings for " + order.getInstrument().getName());
+				return false;
+			}
+			double leverage = order.getInstrument().getLeverageUse();
+			double sl = lastTick.getAsk() * mi.slp / 100.0 / leverage;
+			double tp = lastTick.getAsk() * mi.tpp / 100.0 / leverage;
 			
 			double slp;
 			double tpp;
@@ -150,7 +158,7 @@ class VoiceMenu  implements APICallback{
 				slp = lastTick.getBid() + sl;
 				tpp = lastTick.getAsk() - tp;
 			}
-			double pip = instruments.get(selectedInstrument).instrument.getPipValue();
+			double pip = order.getInstrument().getPipValue();
 			slp = Math.round(slp /pip)*pip;
 			tpp = Math.round(tpp /pip)*pip;
 			speak("Updating SL and TP");
@@ -248,6 +256,13 @@ class VoiceMenu  implements APICallback{
 		p = Math.round(p / d) * d;
 
 		return p / 1e10;
+	}
+	// the MyInstrument holding the configured slp/tpp/quantity for a traded instrument
+	private MyInstrument findMyInstrument(Instrument instrument) {
+		for (MyInstrument mi : instruments)
+			if (instrument.equals(mi.instrument))
+				return mi;
+		return null;
 	}
 	private ITick getLastTick(Instrument instrument) {
 		if (MyStrategy.getContext() == null) {
