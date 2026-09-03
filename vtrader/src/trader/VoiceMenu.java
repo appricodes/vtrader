@@ -36,6 +36,7 @@ import org.ta4j.core.indicators.adx.PlusDIIndicator;
 
 import com.dukascopy.api.IBar;
 import com.dukascopy.api.ICurrency;
+import com.dukascopy.api.IEngine.OrderCommand;
 import com.dukascopy.api.IHistory;
 import com.dukascopy.api.IMessage;
 import com.dukascopy.api.IOrder;
@@ -63,6 +64,9 @@ class VoiceMenu  implements APICallback{
 	private static final double GUARANTEE_SL_PERCENT = 2;
 	private static final double GUARANTEE_TP_PERCENT = 50;
 	private static final long GUARANTEE_RETRY_MS = 5000; // pause after the broker refuses a stop
+	// F11 reverse guard, same percent convention as above
+	private static final double REVERSE_TRIGGER_PERCENT = 5; // adverse move that opens the reverse position
+	private static final double REVERSE_LOCK_PERCENT = 50; // stop and target both sides get once hedged
 
 	private static VoiceMenu instance;
 
@@ -94,6 +98,10 @@ class VoiceMenu  implements APICallback{
 	private IOrder pendingGuaranteeOrder; // order selected via F2, targeted by F10
 	private int guaranteeChoice = GUARANTEE_INSTANT;
 	private final List<ProfitGuarantee> profitGuarantees = new CopyOnWriteArrayList<>();
+
+	// F11 reverse guards, advanced in checkReverseGuards
+	private IOrder pendingReverseOrder; // order selected via F2, targeted by F11
+	private final List<ReverseGuard> reverseGuards = new CopyOnWriteArrayList<>();
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
 	private List<String> textList = new ArrayList<String>();
@@ -130,6 +138,139 @@ class VoiceMenu  implements APICallback{
 			this.order = order;
 			this.targetPrice = targetPrice;
 			this.above = above;
+		}
+	}
+
+	class ReverseGuard {
+		final IOrder original;
+		final double threshold; // adverse price distance from the open price that fires the guard
+		final double originalStopDistance; // the stop distance the position had before F11, halved later
+		IOrder reverse; // the opposite position, once it exists
+		volatile boolean hedged; // the reverse position was opened; the guard never fires again
+		volatile boolean firing; // an order submission or modification is with the broker
+
+		ReverseGuard(IOrder original, double threshold, double originalStopDistance) {
+			this.original = original;
+			this.threshold = threshold;
+			this.originalStopDistance = originalStopDistance;
+		}
+	}
+
+	// opens the opposite position and pushes both sides' stop and target out to REVERSE_LOCK_PERCENT
+	// of the price at this moment. The reverse goes in first: if it cannot be opened the original is
+	// left exactly as it was, rather than sitting on a 50 percent stop with nothing hedging it.
+	class ReverseTask implements Callable<Boolean> {
+		final ReverseGuard guard;
+		final ITick tick;
+
+		ReverseTask(ReverseGuard guard, ITick tick) {
+			this.guard = guard;
+			this.tick = tick;
+		}
+
+		@Override
+		public Boolean call() {
+			IOrder original = guard.original;
+			Instrument instrument = original.getInstrument();
+			String label = original.getLabel();
+			try {
+				double price = original.isLong() ? tick.getBid() : tick.getAsk();
+				double distance = price * REVERSE_LOCK_PERCENT / 100.0 / instrument.getLeverageUse();
+				double pip = instrument.getPipValue();
+				boolean reverseLong = !original.isLong();
+
+				try {
+					double slippage = price * 0.0002 / pip;
+					guard.reverse = MyStrategy.getContext().getEngine().submitOrder(
+							label + "R",
+							instrument,
+							reverseLong ? OrderCommand.BUY : OrderCommand.SELL,
+							original.getAmount(),
+							0,
+							slippage,
+							roundToPip(reverseLong ? price - distance : price + distance, pip),
+							roundToPip(reverseLong ? price + distance : price - distance, pip),
+							0,
+							""
+							);
+				} catch (JFException e) {
+					e.printStackTrace();
+					reverseGuards.remove(guard);
+					speak("Could not open the reverse position for " + label + ". Nothing was changed.");
+					return false;
+				}
+				// from here the guard has done its one job, whatever the modifications below do
+				guard.hedged = true;
+
+				double take = roundToPip(original.isLong() ? price + distance : price - distance, pip);
+				double stop = roundToPip(original.isLong() ? price - distance : price + distance, pip);
+				boolean ok = true;
+				// target first: it is the one that could close the original at a price we no longer want
+				try {
+					original.setTakeProfitPrice(take);
+				} catch (JFException e) {
+					e.printStackTrace();
+					ok = false;
+				}
+				MyUtils.sleep(2000); // a second modification sent too soon is refused
+				try {
+					original.setStopLossPrice(stop);
+				} catch (JFException e) {
+					e.printStackTrace();
+					ok = false;
+				}
+				if (ok)
+					speak(String.format("Reverse position opened against %s. Both sides at %s and %s.",
+							label, formatPrice(stop), formatPrice(take)));
+				else
+					speak("Reverse position opened against " + label
+							+ ", but its own stop and target could not be moved. Check them by hand.");
+				return ok;
+			} finally {
+				guard.firing = false;
+			}
+		}
+	}
+
+	// one side is gone: the survivor's stop goes half the original position's own stop distance away
+	// from the price the other side closed at
+	class ReverseAdjustTask implements Callable<Boolean> {
+		final ReverseGuard guard;
+		final IOrder survivor;
+		final double basePrice;
+
+		ReverseAdjustTask(ReverseGuard guard, IOrder survivor, double basePrice) {
+			this.guard = guard;
+			this.survivor = survivor;
+			this.basePrice = basePrice;
+		}
+
+		@Override
+		public Boolean call() {
+			try {
+				if (guard.originalStopDistance <= 0) {
+					speak("One side closed, but the original position had no stop loss to halve. The stop of "
+							+ survivor.getLabel() + " is unchanged.");
+					return false;
+				}
+				double half = guard.originalStopDistance / 2;
+				double pip = survivor.getInstrument().getPipValue();
+				double stop = roundToPip(survivor.isLong() ? basePrice - half : basePrice + half, pip);
+				try {
+					survivor.setStopLossPrice(stop);
+				} catch (JFException e) {
+					e.printStackTrace();
+					speak("Could not set the stop loss of " + survivor.getLabel() + ". Set it by hand.");
+					return false;
+				}
+				speak(String.format("One side closed. Stop loss of %s set to %s.",
+						survivor.getLabel(), formatPrice(stop)));
+				return true;
+			} finally {
+				// once only, whether or not the broker took it
+				guard.firing = false;
+				reverseGuards.remove(guard);
+			}
 		}
 	}
 
@@ -628,6 +769,24 @@ class VoiceMenu  implements APICallback{
 					else
 						speak("Select a position first, by pressing F2.");
 					break;
+				case  KeyEvent.VK_F11:
+					if (op.equals("open_orders")) {
+						if (openOrders.isEmpty()) {
+							speak("No open positions");
+							break;
+						}
+						op = "reverse_guard";
+						pendingReverseOrder = openOrders.get(idx);
+						speak(String.format(
+								"Reverse guard on %s order %s. If it loses %d percent, an opposite position opens. Press space to confirm.",
+								pendingReverseOrder.isLong() ? "buy" : "sell",
+								pendingReverseOrder.getLabel(),
+								(int) REVERSE_TRIGGER_PERCENT
+								));
+					}
+					else
+						speak("Select a position first, by pressing F2.");
+					break;
 				case  KeyEvent.VK_F12:
 					speak(MyUtils.formatTime(System.currentTimeMillis()));
 					break;
@@ -958,6 +1117,11 @@ class VoiceMenu  implements APICallback{
 			if (pendingGuaranteeOrder == null)
 				return;
 			armProfitGuarantee(pendingGuaranteeOrder, guaranteeChoice);
+		}
+		else if (op.equals("reverse_guard")) {
+			if (pendingReverseOrder == null)
+				return;
+			armReverseGuard(pendingReverseOrder);
 		}
 
 	}
@@ -1514,6 +1678,93 @@ class VoiceMenu  implements APICallback{
 			return;
 		instance.checkPendingConditionalUpdate(instrument, tick);
 		instance.checkProfitGuarantees(instrument, tick);
+		instance.checkReverseGuards(instrument, tick);
+	}
+
+	private double roundToPip(double price, double pip) {
+		double rounded = Math.round(price / pip) * pip;
+		// remove trailing zeros which sometime apears
+		return Math.round(rounded * 1000000) / 1000000.0;
+	}
+
+	// F11: watches one position and, the first time it is more than REVERSE_TRIGGER_PERCENT under
+	// water, opens the opposite position of the same size. Fires once and once only - after that the
+	// guard exists just to set the surviving side's stop when the other one goes.
+	private void armReverseGuard(IOrder order) {
+		if (MyStrategy.getContext() == null) {
+			speak("Please wait");
+			return;
+		}
+		String label = order.getLabel();
+		for (ReverseGuard g : reverseGuards) {
+			if (g.original.getLabel().equals(label)) {
+				speak("A reverse guard is already set on " + label);
+				return;
+			}
+		}
+		// the distance to halve later is the one the position has now, before the guard moves anything
+		double stopLoss = order.getStopLossPrice();
+		double stopDistance = (stopLoss > 0) ? Math.abs(order.getOpenPrice() - stopLoss) : 0;
+		double threshold = order.getOpenPrice() * REVERSE_TRIGGER_PERCENT / 100.0
+				/ order.getInstrument().getLeverageUse();
+		reverseGuards.add(new ReverseGuard(order, threshold, stopDistance));
+		// the guard only ever fires if the position survives long enough to get there. With every
+		// instrument configured at slp 5 and the trigger also at 5 percent, the two land on the same
+		// price and the broker's stop wins, so this is worth saying out loud rather than leaving the
+		// guard to sit there doing nothing.
+		String warning = "";
+		if (stopDistance <= 0)
+			warning = " It has no stop loss, so nothing can be halved when one side closes later.";
+		else if (stopDistance <= threshold)
+			warning = " Warning: its own stop loss is at or inside the trigger, so it will close before"
+					+ " the reverse position can open. Widen the stop loss first.";
+		speak(String.format("Reverse guard set on %s.%s", label, warning));
+	}
+
+	// called for every tick; fires each guard once, then watches the pair
+	private void checkReverseGuards(Instrument instrument, ITick tick) {
+		for (ReverseGuard g : reverseGuards) {
+			if (!g.original.getInstrument().equals(instrument))
+				continue;
+			if (g.firing)
+				continue;
+
+			if (!g.hedged) {
+				if (g.original.getState() != IOrder.State.FILLED) {
+					// closed before it ever went far enough; nothing to guard
+					reverseGuards.remove(g);
+					continue;
+				}
+				// a long is marked against the bid and a short against the ask
+				double exit = g.original.isLong() ? tick.getBid() : tick.getAsk();
+				double adverse = g.original.isLong()
+						? g.original.getOpenPrice() - exit
+						: exit - g.original.getOpenPrice();
+				if (adverse < g.threshold)
+					continue;
+				g.firing = true;
+				MyStrategy.getContext().executeTask(new ReverseTask(g, tick));
+				continue;
+			}
+
+			boolean originalOpen = g.original.getState() == IOrder.State.FILLED;
+			boolean reverseOpen = g.reverse != null && g.reverse.getState() == IOrder.State.FILLED;
+			if (originalOpen && reverseOpen)
+				continue;
+			if (!originalOpen && !reverseOpen) {
+				// both gone, there is no survivor to protect
+				reverseGuards.remove(g);
+				continue;
+			}
+			IOrder survivor = originalOpen ? g.original : g.reverse;
+			IOrder closed = originalOpen ? g.reverse : g.original;
+			// the price the other side actually closed at, which is what the new stop is measured from
+			double base = (closed != null && closed.getClosePrice() > 0)
+					? closed.getClosePrice()
+					: (survivor.isLong() ? tick.getBid() : tick.getAsk());
+			g.firing = true;
+			MyStrategy.getContext().executeTask(new ReverseAdjustTask(g, survivor, base));
+		}
 	}
 
 	private String guaranteeChoiceText() {
