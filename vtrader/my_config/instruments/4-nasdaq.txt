@@ -1,0 +1,8 @@
+name=NASDAQ
+d.name = USATECH.IDX/USD
+fxcm.name= NASDAQ
+slp = 5
+tpp = 15
+skip_digits = 2
+digits = 3
+quantity = 10

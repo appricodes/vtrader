@@ -1,0 +1,8 @@
+name=GBP/USD
+d.name = GBP/USD
+fxcm.name= GBPUSD
+slp = 5
+tpp = 15
+skip_digits = 2
+digits = 3
+quantity = 100

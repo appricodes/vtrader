@@ -1,0 +1,8 @@
+name=USD/CAD
+d.name = USD/CAD
+fxcm.name= USDCAD
+slp = 5
+tpp = 15
+skip_digits = 2
+digits = 3
+quantity = 100

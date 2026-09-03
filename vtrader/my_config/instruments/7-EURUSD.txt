@@ -1,0 +1,8 @@
+name=EUR/USD
+d.name = EUR/USD
+fxcm.name= EURUSD
+slp = 5
+tpp = 15
+skip_digits = 2
+digits = 3
+quantity = 100

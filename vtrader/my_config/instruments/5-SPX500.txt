@@ -1,0 +1,8 @@
+name=S and P 500
+d.name = USA500.IDX/USD
+fxcm.name= SPX500
+slp = 5
+tpp = 15
+skip_digits = 2
+digits = 4
+quantity = 10

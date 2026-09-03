@@ -21,6 +21,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -40,7 +41,8 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
-
+import java.util.Arrays;
+import java.util.Comparator; // Import Comparator
 class MyInstrument {
 	
 	public String name;
@@ -50,12 +52,18 @@ class MyInstrument {
 	public  double slp;
 	public double tpp;
 	public int quantity;
+	// % of balance used as margin (key 6, risk mode). Stored directly instead of re-derived from
+	// quantity each time, so repeated up/down presses don't get stuck on high-priced instruments
+	// where rounding quantity to an int loses the percent. -1 = not yet initialized.
+	public int percent = -1;
+	public int digits;
+	public int skipDigits;
 	public int fxcmLotSize;
 	public String timezone;
 	public Instrument instrument = null;
 	public Properties prop;
 
-	private static HashMap<String, MyInstrument> instruments = new HashMap<String, MyInstrument>();
+	private static LinkedHashMap<String, MyInstrument> instruments = new LinkedHashMap<>();
 	private static HashMap<String, String> fToD = new HashMap<String, String>();
 	private static HashMap<String, String> shortToD = new HashMap<String, String>();
 
@@ -78,13 +86,12 @@ class MyInstrument {
 		this.dName = prop.getProperty("d.name", "").trim();
 		this.slp = Double.parseDouble(prop.getProperty("slp", "5").trim());
 		this.tpp = Double.parseDouble(prop.getProperty("tpp", "20").trim());
-		this.quantity = 10;
+		this.quantity = Integer.parseInt(prop.getProperty("quantity", "20").trim());
+		this.digits = Integer.parseInt(prop.getProperty("digits", "20").trim());
+		this.skipDigits = Integer.parseInt(prop.getProperty("skip_digits", "20").trim());
 		this.instrument = Instrument.fromString(this.dName);
-		if (this.instrument != null)
-			this.dShortName = this.instrument.name();
-		else
-			this.dShortName = "";
-
+		this.dShortName = this.instrument.name();
+		
 		this.fxcmName = prop.getProperty("fxcm.name", this.dName).trim();
 		this.fxcmLotSize = Integer.parseInt(prop.getProperty("fxcm.lot.size", "1000").trim());
 
@@ -145,7 +152,23 @@ class MyInstrument {
 		if (instruments.size() > 0)
 			return;
 		File dir = new File(Main.baseDir + "/my_config/instruments");
-		for (File file : dir.listFiles()) {
+		
+		File[] files = dir.listFiles(); // Get the list of files
+		
+		// IMPORTANT: Check if listFiles() returned null
+		// This happens if 'dir' is not a directory, doesn't exist, or an I/O error occurs.
+		if (files == null) 
+			return;
+		
+		Arrays.sort(files, new Comparator<File>() {
+			@Override
+			public int compare(File f1, File f2) {
+				// Compare files based on their names lexicographically (alphabetically)
+				return f1.getName().compareTo(f2.getName());
+			}
+		});
+		for (File file : files) {
+			System.out.println(file.getName());
 			MyInstrument myInstrument = new MyInstrument(file);
 			if (!myInstrument.getDName().equals(""))
 				instruments.put(myInstrument.dName, myInstrument);

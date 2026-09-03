@@ -1,0 +1,8 @@
+name=dow jones 
+d.name = USA30.IDX/USD
+fxcm.name= dowjones 
+slp = 5
+tpp = 15
+skip_digits = 2
+digits = 3
+quantity = 10

@@ -1,4 +1,3 @@
-
 package trader;
 
 import java.awt.BorderLayout;
@@ -66,28 +65,16 @@ public class Main {
 	public static void main(String[] args) throws Exception {
 		VoiceMenu menu = new VoiceMenu();
 		menu.start();
-		if (false)
-			return;
+
 		String s = "test";
+
 		System.out.println("Starting...");
-		// get password
-		if (false) { 
-			Scanner console = new Scanner(System.in);
-			System.out.println("Password:");
-			String password = console.nextLine();
-			if (!password.equals("kmk")) {
-				System.out.println("Incorrect password");
-				System.exit(0);
-			}
-		}
 		
-		// load config.properties
+		// load configurations
 		loadConfig();
 		
 		// get the instance of the IClient interface
 		client = ClientFactory.getDefaultInstance();
-		//File cacheDir =new File(Main.fastDir + "\\cache");
-		//client.setCacheDirectory(cacheDir);
 
 		setSystemListener();
 		tryToConnect();
@@ -107,6 +94,7 @@ public class Main {
 	}
 
 	private static void setSystemListener() {
+		System.out.println("Setting system listener...");
 		// set the listener that will receive system events
 		client.setSystemListener(new ISystemListener() {
 
@@ -138,16 +126,20 @@ public class Main {
 				tryToReconnect();
 			}
 		});
+		
+		System.out.println("System listener was set successfully.");
 	}
 
 	private static void tryToConnect() throws Exception {
 		LOGGER.info("Connecting...");
 		// connect to the server using jnlp, user name and password
 		if (isDemoMode) {
+			System.out.println("DEMO");
 			speak("Demo Mode. Connecting");
 			client.connect(jnlpUrl, userName, password);
 		}
 		else {
+			System.out.println("Live");
 			speak("Warning! Live Mode. Connecting");
 			client.connect(jnlpUrl, userName, password, PinDialog.showAndGetPin());
 		}
@@ -197,18 +189,22 @@ public class Main {
 
 
 	private static void loadConfig() {
-		File file = new File(baseDir, "my_config" + Main.separator + "config.properties");
+		File file = new File(baseDir, "my_config" + Main.separator + "config.txt");
 		Main.prop = new Properties();
 		InputStream is = null;
 		try {
 			is = new FileInputStream(file);
 		} catch (FileNotFoundException ex) {
+			System.out.println("Cannot found configuration file: " + file.getAbsolutePath());
+			System.out.println("Error: " + ex.getMessage());
 			LOGGER.error("Cannot found configuration file: " + file.getAbsolutePath());
 			System.exit(0);
 		}
 		try {
 			prop.load(is);
 		} catch (IOException ex) {
+			System.out.println("Cannot read configuration file: " + file.getAbsolutePath());
+			System.out.println("Error: " + ex.getMessage());
 			LOGGER.error("Cannot read configuration file: " + file.getAbsolutePath());
 			System.exit(0);
 		}
@@ -224,11 +220,13 @@ public class Main {
 			password = prop.getProperty("d.demo.password").trim();
 			jnlpUrl = "http://platform.dukascopy.com/demo/jforex.jnlp";
 		}
+		System.out.println("Configuration was loaded successfully.");
 	}
 	
 	public static boolean isStopping() {
-		File file = new File(baseDir,  "my_config" + Main.separator + "continue.yes");
-		return !file.exists();
+		return false;
+		//File file = new File(baseDir,  "my_config" + Main.separator + "continue.yes");
+		//return !file.exists();
 	}
 	public static IClient getClient() {
 		return client;
@@ -295,20 +293,43 @@ public class Main {
 			speechEngine = SpeechEngineNative.getInstance();
 			
 			List<Voice> voices = speechEngine.getAvailableVoices();
-
-			System.out.println("For now the following voices are supported:\n");
-			for (Voice voice : voices) {
-				//System.out.printf("%s%n", voice);
-			}
 			Voice voice ;
 
-			// We want to find a voice according to our preferences
+			System.out.println("For now the following voices are supported:\n");
+			for (Voice v : voices) {
+				System.out.printf("%s%n", v);
+				//if (v.getName().equalsIgnoreCase("Samantha") && v.getCulture().equalsIgnoreCase("en_US")) {
+				//if (v.getName().equalsIgnoreCase("Microsoft Hazel Desktop") && v.getCulture().equalsIgnoreCase("en-GB")) {
+					//voice = v;
+					//voiceId = voices.indexOf(voice);
+				//}
+			}
+
+			// default voice
 			if (voiceId == -9999) {
+				for (Voice v : voices) {
+					if (v.getName().equalsIgnoreCase("Samantha") && v.getCulture().equalsIgnoreCase("en_US")) {
+					// if (v.getName().equalsIgnoreCase("Microsoft Hazel Desktop") && v.getCulture().equalsIgnoreCase("en-GB")) {
+						voice = v;
+						voiceId = voices.indexOf(voice);
+					}
+				}
+			}
+			if (voiceId == -9999) {
+			// We want to find a voice according to our preferences
 				VoicePreferences voicePreferences = new VoicePreferences();
 				voicePreferences.setLanguage("en"); //  ISO-639-1
 				voicePreferences.setCountry("US"); // ISO 3166-1 Alpha-2 code
 				voicePreferences.setGender(VoicePreferences.Gender.FEMALE);
 				voice = speechEngine.findVoiceByPreferences(voicePreferences);
+				
+				// if no voice is matched, broaden criteria
+				if (voice == null) {
+					voicePreferences = new VoicePreferences();
+					voicePreferences.setLanguage("en"); //  ISO-639-1
+					voicePreferences.setGender(VoicePreferences.Gender.FEMALE);
+					voice = speechEngine.findVoiceByPreferences(voicePreferences);
+				}
 				
 				// simple fallback just in case our preferences didn't match any voice
 				if (voice == null) {
