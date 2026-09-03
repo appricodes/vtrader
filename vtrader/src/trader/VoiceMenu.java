@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import javax.swing.JFrame;
 import javax.swing.JTextField;
@@ -54,6 +55,12 @@ class VoiceMenu  implements APICallback{
 	private static final int TYPE_HEDGE = 3;
 	private static final int MAX_DAYS_BACK = 60; // ~2 months
 	private static final int MAX_RISK_PERCENT = 200; // upper bound of the key 6 balance-usage percent
+	// F10 profit guarantee. Percentages follow the convention used everywhere else in this class:
+	// distance = price * percent / 100 / leverage.
+	private static final int GUARANTEE_INSTANT = 0;
+	private static final int GUARANTEE_CONDITIONAL = 1;
+	private static final double GUARANTEE_SL_PERCENT = 2;
+	private static final double GUARANTEE_TP_PERCENT = 50;
 
 	private static VoiceMenu instance;
 
@@ -79,6 +86,12 @@ class VoiceMenu  implements APICallback{
 
 	// armed conditional SL/TP updates, one per order, watched against live ticks in checkPendingConditionalUpdate
 	private List<PendingConditionalUpdate> pendingConditionalUpdates = new ArrayList<>();
+
+	// F10 profit guarantee: trailing stops armed on open positions, advanced in checkProfitGuarantees.
+	// Copy-on-write because the key handler adds from the event thread while onTick iterates.
+	private IOrder pendingGuaranteeOrder; // order selected via F2, targeted by F10
+	private int guaranteeChoice = GUARANTEE_INSTANT;
+	private final List<ProfitGuarantee> profitGuarantees = new CopyOnWriteArrayList<>();
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
 	private List<String> textList = new ArrayList<String>();
@@ -115,6 +128,60 @@ class VoiceMenu  implements APICallback{
 			this.order = order;
 			this.targetPrice = targetPrice;
 			this.above = above;
+		}
+	}
+
+	class ProfitGuarantee {
+		final IOrder order;
+		double triggerPrice;   // conditional mode: price the order's take profit was set to
+		boolean trailing;      // false while a conditional guarantee still waits for its trigger
+		double stopPrice;      // last stop we asked the broker for; only ever tightens
+		volatile boolean inFlight; // a modification is with the broker; do not send another
+		volatile boolean rejected; // a rejection was already announced for this streak
+
+		ProfitGuarantee(IOrder order, boolean conditional, double triggerPrice) {
+			this.order = order;
+			this.trailing = !conditional;
+			this.triggerPrice = triggerPrice;
+		}
+	}
+
+	// sets the stop loss and/or take profit of a guarded order. NaN means "leave this one alone".
+	class GuaranteeTask implements Callable<Boolean> {
+		final ProfitGuarantee guarantee;
+		final double stop;
+		final double takeProfit;
+
+		GuaranteeTask(ProfitGuarantee guarantee, double stop, double takeProfit) {
+			this.guarantee = guarantee;
+			this.stop = stop;
+			this.takeProfit = takeProfit;
+		}
+
+		@Override
+		public Boolean call() {
+			try {
+				if (!Double.isNaN(stop))
+					guarantee.order.setStopLossPrice(stop);
+				if (!Double.isNaN(stop) && !Double.isNaN(takeProfit))
+					MyUtils.sleep(2000);
+				if (!Double.isNaN(takeProfit))
+					guarantee.order.setTakeProfitPrice(takeProfit);
+				guarantee.rejected = false;
+				return true;
+			} catch (JFException e) {
+				e.printStackTrace();
+				// brokers enforce a minimum stop distance; without this the rejection would be
+				// announced again on every tick. stopPrice keeps the attempted value, so the next
+				// attempt only happens once the price has moved further in our favour.
+				if (!guarantee.rejected) {
+					guarantee.rejected = true;
+					speak("Broker rejected the guarantee stop loss on " + guarantee.order.getLabel());
+				}
+				return false;
+			} finally {
+				guarantee.inFlight = false;
+			}
 		}
 	}
 
@@ -501,6 +568,26 @@ class VoiceMenu  implements APICallback{
 						speak("Hedging mode");
 					}
 					break;
+				case  KeyEvent.VK_F10:
+					if (op.equals("open_orders")) {
+						if (openOrders.isEmpty()) {
+							speak("No open positions");
+							break;
+						}
+						op = "guarantee";
+						pendingGuaranteeOrder = openOrders.get(idx);
+						guaranteeChoice = GUARANTEE_INSTANT;
+						// one speak() per announcement: each call cuts the previous one off
+						speak(String.format(
+								"Profit guarantee for %s order %s. Use up and down to choose. %s",
+								pendingGuaranteeOrder.isLong() ? "buy" : "sell",
+								pendingGuaranteeOrder.getLabel(),
+								guaranteeChoiceText()
+								));
+					}
+					else
+						speak("Select a position first, by pressing F2.");
+					break;
 				case  KeyEvent.VK_F12:
 					speak(MyUtils.formatTime(System.currentTimeMillis()));
 					break;
@@ -665,6 +752,12 @@ class VoiceMenu  implements APICallback{
 			currentDayStats = stats;
 			speakDayStats(stats);
 		}
+		else if (op.equals("guarantee")) {
+			// two entries, and the cursor keys hand us steps of 1, 10 or a billion
+			guaranteeChoice += Integer.signum(direction);
+			guaranteeChoice = Math.max(GUARANTEE_INSTANT, Math.min(GUARANTEE_CONDITIONAL, guaranteeChoice));
+			speak(guaranteeChoiceText());
+		}
 		else if (op.equals("messages")) {
 			idx += direction;
 			if (idx < 0)
@@ -820,6 +913,11 @@ class VoiceMenu  implements APICallback{
 				pendingConditionalUpdates.add(new PendingConditionalUpdate(pendingUpdateOrder, updateTargetPrice, updateTargetLevel > 0));
 				speak("Will update stop loss and take profit when price reaches " + formatPrice(updateTargetPrice));
 			}
+		}
+		else if (op.equals("guarantee")) {
+			if (pendingGuaranteeOrder == null)
+				return;
+			armProfitGuarantee(pendingGuaranteeOrder, guaranteeChoice);
 		}
 
 	}
@@ -1283,8 +1381,115 @@ class VoiceMenu  implements APICallback{
 
 	// called from MyStrategy.onTick for every tick; delegates to the singleton instance
 	public static void checkConditionalUpdate(Instrument instrument, ITick tick) {
-		if (instance != null)
-			instance.checkPendingConditionalUpdate(instrument, tick);
+		if (instance == null)
+			return;
+		instance.checkPendingConditionalUpdate(instrument, tick);
+		instance.checkProfitGuarantees(instrument, tick);
+	}
+
+	private String guaranteeChoiceText() {
+		if (guaranteeChoice == GUARANTEE_INSTANT)
+			return "Instant guarantee: stop loss at 2 percent, following the price. Press enter to confirm.";
+		return "Conditional guarantee: wait for the take profit price, then follow the price. Press enter to confirm.";
+	}
+
+	// a level 'percent' away from the current price, on the profitable or the losing side of the
+	// order. Same distance convention as the rest of the class: price * percent / 100 / leverage.
+	private double guaranteeLevel(IOrder order, ITick tick, double percent, boolean profitable) {
+		Instrument instrument = order.getInstrument();
+		double ref = order.isLong() ? tick.getAsk() : tick.getBid();
+		double distance = ref * percent / 100.0 / instrument.getLeverageUse();
+		double price = (order.isLong() == profitable) ? ref + distance : ref - distance;
+		double pip = instrument.getPipValue();
+		price = Math.round(price / pip) * pip;
+		// remove trailing zeros which sometime apears
+		return Math.round(price * 1000000) / 1000000.0;
+	}
+
+	// F10: puts a trailing stop on an already-open position. The instant mode starts trailing at
+	// once; the conditional mode waits for the price the order's take profit was set to. Both push
+	// the real take profit far out of reach, so the broker cannot close the position there and the
+	// exit stays with the trailing stop.
+	private void armProfitGuarantee(IOrder order, int choice) {
+		if (MyStrategy.getContext() == null) {
+			speak("Please wait");
+			return;
+		}
+		ITick tick = getLastTick(order.getInstrument());
+		if (tick == null)
+			return;
+
+		double triggerPrice = 0;
+		if (choice == GUARANTEE_CONDITIONAL) {
+			triggerPrice = order.getTakeProfitPrice();
+			if (triggerPrice <= 0) {
+				speak("No take profit set on this order. Conditional guarantee needs one.");
+				return;
+			}
+		}
+
+		String label = order.getLabel();
+		profitGuarantees.removeIf(p -> p.order.getLabel().equals(label));
+		ProfitGuarantee g = new ProfitGuarantee(order, choice == GUARANTEE_CONDITIONAL, triggerPrice);
+		profitGuarantees.add(g);
+
+		double takeProfit = guaranteeLevel(order, tick, GUARANTEE_TP_PERCENT, true);
+		if (choice == GUARANTEE_INSTANT) {
+			// placed unconditionally, even when it tightens an existing stop or locks in a loss:
+			// the point of the instant mode is "from here on I lose no more than 2 percent"
+			double stop = guaranteeLevel(order, tick, GUARANTEE_SL_PERCENT, false);
+			g.stopPrice = stop;
+			submitGuarantee(g, stop, takeProfit);
+			speak(String.format("Instant guarantee on %s. Stop loss %s.", label, formatPrice(stop)));
+		}
+		else {
+			submitGuarantee(g, Double.NaN, takeProfit);
+			speak(String.format("Conditional guarantee on %s. Waiting for %s.", label, formatPrice(triggerPrice)));
+		}
+	}
+
+	private void submitGuarantee(ProfitGuarantee g, double stop, double takeProfit) {
+		g.inFlight = true;
+		MyStrategy.getContext().executeTask(new GuaranteeTask(g, stop, takeProfit));
+	}
+
+	// called for every tick; moves each armed guarantee along
+	private void checkProfitGuarantees(Instrument instrument, ITick tick) {
+		for (ProfitGuarantee g : profitGuarantees) {
+			if (!g.order.getInstrument().equals(instrument))
+				continue;
+			if (g.order.getState() != IOrder.State.FILLED) {
+				// the stop was hit, or the position was closed by hand
+				profitGuarantees.remove(g);
+				continue;
+			}
+			if (g.inFlight)
+				continue;
+
+			if (!g.trailing) {
+				// a long position exits at the bid and a short at the ask, so that is the price the
+				// take profit would have been filled at
+				double exit = g.order.isLong() ? tick.getBid() : tick.getAsk();
+				boolean reached = g.order.isLong() ? exit >= g.triggerPrice : exit <= g.triggerPrice;
+				if (!reached)
+					continue;
+				g.trailing = true;
+				double stop = guaranteeLevel(g.order, tick, GUARANTEE_SL_PERCENT, false);
+				g.stopPrice = stop;
+				submitGuarantee(g, stop, Double.NaN);
+				speak(String.format("Target reached on %s. Stop loss %s.", g.order.getLabel(), formatPrice(stop)));
+				continue;
+			}
+
+			double stop = guaranteeLevel(g.order, tick, GUARANTEE_SL_PERCENT, false);
+			// the stop only ever tightens - higher for a long, lower for a short. When the price moves
+			// against us the new level is worse than the one we hold, and we leave it alone.
+			boolean better = g.order.isLong() ? stop > g.stopPrice : stop < g.stopPrice;
+			if (!better)
+				continue;
+			g.stopPrice = stop;
+			submitGuarantee(g, stop, Double.NaN);
+		}
 	}
 
 	private void checkPendingConditionalUpdate(Instrument instrument, ITick tick) {
