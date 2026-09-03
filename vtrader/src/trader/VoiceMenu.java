@@ -35,6 +35,7 @@ import org.ta4j.core.indicators.adx.MinusDIIndicator;
 import org.ta4j.core.indicators.adx.PlusDIIndicator;
 
 import com.dukascopy.api.IBar;
+import com.dukascopy.api.ICurrency;
 import com.dukascopy.api.IHistory;
 import com.dukascopy.api.IMessage;
 import com.dukascopy.api.IOrder;
@@ -474,14 +475,30 @@ class VoiceMenu  implements APICallback{
 						reportPrice(TYPE_BUY, !shift, instruments.get(selectedInstrument));
 					}
 					break;
-				case  KeyEvent.VK_3:
-					op = "slp";
-					reportSLP();
+				case  KeyEvent.VK_3: {
+					boolean shift = shiftDown || e.isShiftDown();
+					if (shift) {
+						shiftUsedAsModifier = true;
+						reportPotential(true);
+					}
+					else {
+						op = "slp";
+						reportSLP();
+					}
 					break;
-				case  KeyEvent.VK_4:
-					op = "tpp";
-					reportTPP();
+				}
+				case  KeyEvent.VK_4: {
+					boolean shift = shiftDown || e.isShiftDown();
+					if (shift) {
+						shiftUsedAsModifier = true;
+						reportPotential(false);
+					}
+					else {
+						op = "tpp";
+						reportTPP();
+					}
 					break;
+				}
 				case  KeyEvent.VK_5:
 					op = "quantity";
 					reportQuantity();
@@ -995,6 +1012,95 @@ class VoiceMenu  implements APICallback{
 						MyUtils.formatTime(message.getCreationTime())
 				));
 	}
+	// Account-currency value of a one point move in the instrument's price for this position.
+	// Derived from the platform's own profit figure whenever the position has moved at least a pip,
+	// so contract size, quote currency and the conversion rate all come from the platform instead of
+	// being reconstructed here. Only a position still sitting on its open price needs the pip cost
+	// API, and there the sign cannot go wrong because the move is measured in the profitable
+	// direction either way.
+	private double accountValuePerPricePoint(IOrder order, ITick tick) throws JFException {
+		// a long is closed at the bid and a short at the ask
+		double exit = order.isLong() ? tick.getBid() : tick.getAsk();
+		double move = order.isLong() ? exit - order.getOpenPrice() : order.getOpenPrice() - exit;
+		double pip = order.getInstrument().getPipValue();
+		double profit = order.getProfitLossInAccountCurrency();
+		if (Math.abs(move) >= pip && profit != 0)
+			return profit / move;
+		ICurrency accountCurrency = MyStrategy.getContext().getAccount().getAccountCurrency();
+		double perPip = MyStrategy.getContext().getUtils().convertPipToCurrency(order.getInstrument(), accountCurrency);
+		return perPip * order.getAmount() * 1000000 / pip;
+	}
+
+	// Shift+3 and Shift+4: what all open positions together would be worth if every one of them ran
+	// to its stop loss, or to its take profit, set against what closing them all right now would
+	// give. A position with no level on that side stays open, so it contributes what it is worth now
+	// and is reported as not counted.
+	private void reportPotential(boolean stopLossSide) {
+		if (MyStrategy.getContext() == null) {
+			speak("Not connected.");
+			return;
+		}
+		List<IOrder> orders;
+		try {
+			orders = MyStrategy.getContext().getEngine().getOrders();
+		} catch (JFException e) {
+			e.printStackTrace();
+			speak("Error");
+			return;
+		}
+
+		double now = 0;
+		double potential = 0;
+		int counted = 0;
+		int missing = 0;
+		for (IOrder order : orders) {
+			if (order.getState() != IOrder.State.FILLED)
+				continue;
+			// the same round trip estimate the open position list already speaks
+			double commission = 2 * order.getCommission();
+			double current = order.getProfitLossInAccountCurrency() + commission;
+			now += current;
+
+			double target = stopLossSide ? order.getStopLossPrice() : order.getTakeProfitPrice();
+			ITick tick = (target > 0) ? getLastTick(order.getInstrument()) : null;
+			if (tick == null) {
+				missing++;
+				potential += current;
+				continue;
+			}
+			try {
+				double perPoint = accountValuePerPricePoint(order, tick);
+				double move = order.isLong() ? target - order.getOpenPrice() : order.getOpenPrice() - target;
+				potential += perPoint * move + commission;
+				counted++;
+			} catch (JFException e) {
+				e.printStackTrace();
+				missing++;
+				potential += current;
+			}
+		}
+
+		if (counted == 0 && missing == 0) {
+			speak("No open positions");
+			return;
+		}
+		String tail = (missing > 0)
+				? String.format(" %d without a %s.", missing, stopLossSide ? "stop loss" : "take profit")
+				: "";
+		speak(String.format(
+				"If all %s are hit: %s. Closing now: %s. Difference: %s.%s",
+				stopLossSide ? "stop losses" : "take profits",
+				formatPrice(roundMoney(potential)),
+				formatPrice(roundMoney(now)),
+				formatPrice(roundMoney(potential - now)),
+				tail
+				));
+	}
+
+	private double roundMoney(double amount) {
+		return Math.round(amount * 100) / 100.0;
+	}
+
 	private void reportAccount() {
 		if (MyStrategy.getContext() != null) {
 			String currency = MyStrategy.getContext().getAccount().getAccountCurrency().getSymbol();
