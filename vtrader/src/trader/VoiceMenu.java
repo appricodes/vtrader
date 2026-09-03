@@ -1747,19 +1747,28 @@ class VoiceMenu  implements APICallback{
 				continue;
 			}
 
-			boolean originalOpen = g.original.getState() == IOrder.State.FILLED;
-			boolean reverseOpen = g.reverse != null && g.reverse.getState() == IOrder.State.FILLED;
-			if (originalOpen && reverseOpen)
+			// submitOrder hands back a CREATED order and the fill arrives later, so the test has to be
+			// "is this one gone" rather than "is this one filled" - otherwise the reverse counts as
+			// closed on the very next tick and the pair is torn down as soon as it is built
+			if (g.reverse.getState() == IOrder.State.CANCELED) {
+				// the hedge never existed; the original keeps the levels the guard gave it
+				reverseGuards.remove(g);
+				speak("The reverse position against " + g.original.getLabel() + " was canceled.");
 				continue;
-			if (!originalOpen && !reverseOpen) {
+			}
+			boolean originalGone = g.original.getState() == IOrder.State.CLOSED;
+			boolean reverseGone = g.reverse.getState() == IOrder.State.CLOSED;
+			if (!originalGone && !reverseGone)
+				continue;
+			if (originalGone && reverseGone) {
 				// both gone, there is no survivor to protect
 				reverseGuards.remove(g);
 				continue;
 			}
-			IOrder survivor = originalOpen ? g.original : g.reverse;
-			IOrder closed = originalOpen ? g.reverse : g.original;
+			IOrder survivor = originalGone ? g.reverse : g.original;
+			IOrder closed = originalGone ? g.original : g.reverse;
 			// the price the other side actually closed at, which is what the new stop is measured from
-			double base = (closed != null && closed.getClosePrice() > 0)
+			double base = (closed.getClosePrice() > 0)
 					? closed.getClosePrice()
 					: (survivor.isLong() ? tick.getBid() : tick.getAsk());
 			g.firing = true;
