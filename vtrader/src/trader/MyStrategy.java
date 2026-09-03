@@ -34,10 +34,9 @@ public class MyStrategy implements IStrategy {
 		MyStrategy.context = context;
 
 		Main.speak("Ready");
-
+		
 		// load settings of instruments 
 		MyInstrument.load();
-		//MyInstrument.test();
 
 		// subscribe instruments
 		if (MyInstrument.getInstruments().isEmpty()) {
@@ -69,6 +68,7 @@ public class MyStrategy implements IStrategy {
 	}
 
 	public void onTick(Instrument instrument, ITick tick) throws JFException {
+		VoiceMenu.checkConditionalUpdate(instrument, tick);
 	}
 	public void onBar(Instrument instrument, Period period, IBar askBar, IBar bidBar) {
 	}

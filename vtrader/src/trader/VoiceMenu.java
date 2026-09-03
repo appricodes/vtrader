@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -53,6 +54,8 @@ class VoiceMenu  implements APICallback{
 	private static final int TYPE_HEDGE = 3;
 	private static final int MAX_DAYS_BACK = 60; // ~2 months
 
+	private static VoiceMenu instance;
+
 	private List<MyInstrument> instruments ;
 	private int selectedInstrument = 0;
 	private String op = "instrument";
@@ -66,6 +69,15 @@ class VoiceMenu  implements APICallback{
 	private boolean shiftDown = false; // tracked manually: modifier bit on arrow-key events is unreliable on some setups
 	private boolean shiftUsedAsModifier = false; // true once Shift was combined with another key, to distinguish a plain Shift tap from Shift+arrow
 	private int rate = 25; // speech rate
+
+	// F4 stop loss / take profit update: target price selection state
+	private IOrder pendingUpdateOrder; // order selected via F2, targeted by F4
+	private ITick updateInitTick; // tick captured at F4 press; fixed baseline for target stepping
+	private int updateTargetLevel = 0; // 0 = "Now" (immediate); >0 = ask + level*step; <0 = bid + level*step
+	private double updateTargetPrice; // computed target price when updateTargetLevel != 0
+
+	// armed conditional SL/TP updates, one per order, watched against live ticks in checkPendingConditionalUpdate
+	private List<PendingConditionalUpdate> pendingConditionalUpdates = new ArrayList<>();
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
 	private List<String> textList = new ArrayList<String>();
@@ -88,6 +100,18 @@ class VoiceMenu  implements APICallback{
 				e.printStackTrace();
 				return false;
 			}
+		}
+	}
+
+	class PendingConditionalUpdate {
+		final IOrder order;
+		final double targetPrice;
+		final boolean above; // true: trigger when ask rises to target; false: trigger when bid falls to target
+
+		PendingConditionalUpdate(IOrder order, double targetPrice, boolean above) {
+			this.order = order;
+			this.targetPrice = targetPrice;
+			this.above = above;
 		}
 	}
 
@@ -147,6 +171,7 @@ class VoiceMenu  implements APICallback{
 
 
 	public VoiceMenu() {
+		instance = this;
 		SineWaveGenerator generator = new SineWaveGenerator();
 		//generator.play();
 		MyInstrument.load();
@@ -314,6 +339,8 @@ class VoiceMenu  implements APICallback{
 						adjustOpenPrice(-1);
 					else if (op.equals("days"))
 						speakDayMin();
+					else if (op.equals("update_sl_tp"))
+						adjustUpdateTarget(-1);
 					else {
 						boolean shift = shiftDown || e.isShiftDown();
 						if (shift)
@@ -326,6 +353,8 @@ class VoiceMenu  implements APICallback{
 						adjustOpenPrice(1);
 					else if (op.equals("days"))
 						speakDayMax();
+					else if (op.equals("update_sl_tp"))
+						adjustUpdateTarget(1);
 					else {
 						boolean shift = shiftDown || e.isShiftDown();
 						if (shift)
@@ -376,8 +405,11 @@ class VoiceMenu  implements APICallback{
 						}
 						op = "update_sl_tp";
 						IOrder order = openOrders.get(idx);
+						pendingUpdateOrder = order;
+						updateInitTick = getLastTick(order.getInstrument());
+						updateTargetLevel = 0;
 						speak(String.format(
-								"Update stop loss and take profit of %s order %s, to: %s%%, and %s%%? Press space to confirm.",
+								"Update stop loss and take profit of %s order %s, to: %s%%, and %s%%? Press enter to confirm now, or use left and right to set a target price.",
 								(order.isLong()) ? "buy" : "sell",
 										order.getLabel(),
 										formatPrice(instruments.get(selectedInstrument).slp),
@@ -407,6 +439,7 @@ class VoiceMenu  implements APICallback{
 					processRate();
 					break;
 				case  KeyEvent.VK_SPACE:
+				case  KeyEvent.VK_ENTER:
 					processConfirm();
 					op = "";
 					break;
@@ -498,12 +531,20 @@ class VoiceMenu  implements APICallback{
 
 		}
 		else if (op.equals("quantity")) {
-			if (instruments.get(selectedInstrument).quantity  < 10)
+			MyInstrument instrument = instruments.get(selectedInstrument);
+			if (instrument.quantity  < 10)
 				direction *= 10;
-			instruments.get(selectedInstrument).quantity = (int)increasePrice(instruments.get(selectedInstrument).quantity, direction);
-			if (instruments.get(selectedInstrument).quantity < 1)
-				instruments.get(selectedInstrument).quantity = 1;
-			speak(String.format("%d", instruments.get(selectedInstrument).quantity));
+			instrument.quantity = (int)increasePrice(instrument.quantity, direction);
+			if (instrument.quantity < 1)
+				instrument.quantity = 1;
+			// keep the risk percent in sync with the manually-adjusted quantity, when price data is available
+			if (MyStrategy.getContext() != null) {
+				ITick tick = getLastTick(instrument.getInstrument());
+				double leverage = instrument.instrument.getLeverageUse();
+				if (tick != null && leverage > 0)
+					instrument.percent = computeRiskPercent(instrument, tick.getAsk(), leverage);
+			}
+			speak(String.format("%d", instrument.quantity));
 		}
 		else if (op.equals("risk")) {
 			if (MyStrategy.getContext() == null) {
@@ -511,16 +552,24 @@ class VoiceMenu  implements APICallback{
 			}
 			else {
 				MyInstrument instrument = instruments.get(selectedInstrument);
-				double slDistance = getStopLossDistance(instrument);
-				if (slDistance <= 0) {
+				ITick tick = getLastTick(instrument.getInstrument());
+				double leverage = instrument.instrument.getLeverageUse();
+				if (tick == null || leverage <= 0) {
 					speak("Please wait.");
 				}
 				else {
-					int percent = computeRiskPercent(instrument, slDistance);
-					percent += direction * 5;
+					double askPrice = tick.getAsk();
+					// percent is stored directly on the instrument now, not re-derived from quantity
+					// each time - that round trip used to get stuck on high-priced instruments where
+					// rounding quantity to an int couldn't tell two nearby percents apart.
+					if (instrument.percent < 0)
+						instrument.percent = computeRiskPercent(instrument, askPrice, leverage);
+					int percent = instrument.percent + direction * 5;
 					percent = Math.max(5, Math.min(70, percent));
+					instrument.percent = percent;
 					double balance = MyStrategy.getContext().getAccount().getBalance();
-					int newQuantity = (int) Math.round(balance * percent / 100.0 / slDistance);
+					// percent of balance used as margin; quantity = margin * leverage / price
+					int newQuantity = (int) Math.round(balance * percent / 100.0 * leverage / askPrice);
 					if (newQuantity < 1)
 						newQuantity = 1;
 					instrument.quantity = newQuantity;
@@ -648,36 +697,35 @@ class VoiceMenu  implements APICallback{
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
 	}
-	// price distance from current ask to the configured stop loss level
-	private double getStopLossDistance(MyInstrument instrument) {
-		ITick tick = getLastTick(instrument.getInstrument());
-		if (tick == null)
-			return 0;
-		return tick.getAsk() * instrument.slp / 100.0 / instrument.instrument.getLeverageUse();
-	}
-	// derives the risk percent (rounded to the nearest 5%, 5-70) that the instrument's
-	// current quantity corresponds to, so quantity stays the single source of truth
-	private int computeRiskPercent(MyInstrument instrument, double slDistance) {
+	// derives the balance-usage percent (rounded to the nearest 5%, 5-70) that a quantity
+	// corresponds to. Used to keep instrument.percent in sync whenever quantity is set some
+	// other way (key 5, or the initial seed the first time key 6 is used).
+	// quantity = (balance * percent/100) * leverage / askPrice, so percent is the inverse of that.
+	private int computeRiskPercent(MyInstrument instrument, double askPrice, double leverage) {
 		double balance = MyStrategy.getContext().getAccount().getBalance();
-		if (balance <= 0 || slDistance <= 0)
+		if (balance <= 0 || askPrice <= 0 || leverage <= 0)
 			return 5;
-		double percent = instrument.quantity * slDistance / balance * 100.0;
+		double percent = instrument.quantity * askPrice / leverage / balance * 100.0;
 		int rounded = (int) (Math.round(percent / 5.0) * 5);
 		return Math.max(5, Math.min(70, rounded));
 	}
 	private void reportRisk() {
-		if (MyStrategy.getContext() == null) {
-			speak("Please wait.");
-			return;
-		}
 		MyInstrument instrument = instruments.get(selectedInstrument);
-		double slDistance = getStopLossDistance(instrument);
-		if (slDistance <= 0) {
-			speak("Please wait.");
-			return;
+		if (instrument.percent < 0) {
+			// not seeded yet: derive an initial value from the instrument's configured quantity
+			if (MyStrategy.getContext() == null) {
+				speak("Please wait.");
+				return;
+			}
+			ITick tick = getLastTick(instrument.getInstrument());
+			double leverage = instrument.instrument.getLeverageUse();
+			if (tick == null || leverage <= 0) {
+				speak("Please wait.");
+				return;
+			}
+			instrument.percent = computeRiskPercent(instrument, tick.getAsk(), leverage);
 		}
-		int percent = computeRiskPercent(instrument, slDistance);
-		speak(String.format("Risk %d%%, quantity %d", percent, instrument.quantity));
+		speak(String.format("Risk %d%%, quantity %d", instrument.percent, instrument.quantity));
 	}
 	private void processRate() {
 		rate += 20;
@@ -736,8 +784,17 @@ class VoiceMenu  implements APICallback{
 			MyStrategy.getContext().executeTask(new CloseOrderTask(order));
 		}
 		else if (op.equals("update_sl_tp")) {
-			IOrder order = openOrders.get(idx);
-			MyStrategy.getContext().executeTask(new UpdateOrderTask(order));
+			if (pendingUpdateOrder == null)
+				return;
+			if (updateTargetLevel == 0) {
+				MyStrategy.getContext().executeTask(new UpdateOrderTask(pendingUpdateOrder));
+			}
+			else {
+				String label = pendingUpdateOrder.getLabel();
+				pendingConditionalUpdates.removeIf(p -> p.order.getLabel().equals(label));
+				pendingConditionalUpdates.add(new PendingConditionalUpdate(pendingUpdateOrder, updateTargetPrice, updateTargetLevel > 0));
+				speak("Will update stop loss and take profit when price reaches " + formatPrice(updateTargetPrice));
+			}
 		}
 
 	}
@@ -1151,6 +1208,54 @@ class VoiceMenu  implements APICallback{
 		}
 		else {
 			speak("Target price " + openPrice + ". Press up for buy, down for sell.");
+		}
+	}
+
+	// rounds to at most 'digits' significant figures, e.g. (52365.21, 5) -> 52365, (6543.21, 5) -> 6543.2
+	private double roundToSignificantDigits(double value, int digits) {
+		if (value == 0)
+			return 0;
+		double d = Math.ceil(Math.log10(Math.abs(value)));
+		int power = digits - (int) d;
+		double magnitude = Math.pow(10, power);
+		return Math.round(value * magnitude) / magnitude;
+	}
+
+	private void adjustUpdateTarget(int direction) {
+		updateTargetLevel += direction;
+		if (updateTargetLevel == 0) {
+			speak("Now");
+			return;
+		}
+		double mid = (updateInitTick.getAsk() + updateInitTick.getBid()) / 2.0;
+		double step = mid / 5000.0;
+		double target;
+		if (updateTargetLevel > 0)
+			target = updateInitTick.getAsk() + updateTargetLevel * step;
+		else
+			target = updateInitTick.getBid() + updateTargetLevel * step;
+		updateTargetPrice = roundToSignificantDigits(target, 5);
+		speak("Target: " + formatPrice(updateTargetPrice));
+	}
+
+	// called from MyStrategy.onTick for every tick; delegates to the singleton instance
+	public static void checkConditionalUpdate(Instrument instrument, ITick tick) {
+		if (instance != null)
+			instance.checkPendingConditionalUpdate(instrument, tick);
+	}
+
+	private void checkPendingConditionalUpdate(Instrument instrument, ITick tick) {
+		Iterator<PendingConditionalUpdate> it = pendingConditionalUpdates.iterator();
+		while (it.hasNext()) {
+			PendingConditionalUpdate p = it.next();
+			if (!p.order.getInstrument().equals(instrument))
+				continue;
+			boolean reached = p.above ? tick.getAsk() >= p.targetPrice : tick.getBid() <= p.targetPrice;
+			if (reached) {
+				it.remove();
+				MyStrategy.getContext().executeTask(new UpdateOrderTask(p.order));
+				speak("Target price reached. Updating stop loss and take profit.");
+			}
 		}
 	}
 
