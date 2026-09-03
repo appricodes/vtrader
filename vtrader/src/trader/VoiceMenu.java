@@ -53,6 +53,7 @@ class VoiceMenu  implements APICallback{
 	private static final int TYPE_SELL = 2;
 	private static final int TYPE_HEDGE = 3;
 	private static final int MAX_DAYS_BACK = 60; // ~2 months
+	private static final int MAX_RISK_PERCENT = 200; // upper bound of the key 6 balance-usage percent
 
 	private static VoiceMenu instance;
 
@@ -571,7 +572,7 @@ class VoiceMenu  implements APICallback{
 					if (instrument.percent < 0)
 						instrument.percent = computeRiskPercent(instrument, askPrice, leverage);
 					int percent = instrument.percent + direction * 5;
-					percent = Math.max(5, Math.min(70, percent));
+					percent = Math.max(5, Math.min(MAX_RISK_PERCENT, percent));
 					instrument.percent = percent;
 					double balance = MyStrategy.getContext().getAccount().getBalance();
 					// percent of balance used as margin; quantity = margin * leverage / price
@@ -706,7 +707,7 @@ class VoiceMenu  implements APICallback{
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
 	}
-	// derives the balance-usage percent (rounded to the nearest 5%, 5-70) that a quantity
+	// derives the balance-usage percent (rounded to the nearest 5%, 5 to MAX_RISK_PERCENT) that a quantity
 	// corresponds to. Used to keep instrument.percent in sync whenever quantity is set some
 	// other way (key 5, or the initial seed the first time key 6 is used).
 	// quantity = (balance * percent/100) * leverage / askPrice, so percent is the inverse of that.
@@ -716,7 +717,7 @@ class VoiceMenu  implements APICallback{
 			return 5;
 		double percent = instrument.quantity * askPrice / leverage / balance * 100.0;
 		int rounded = (int) (Math.round(percent / 5.0) * 5);
-		return Math.max(5, Math.min(70, rounded));
+		return Math.max(5, Math.min(MAX_RISK_PERCENT, rounded));
 	}
 	private void reportRisk() {
 		MyInstrument instrument = instruments.get(selectedInstrument);
