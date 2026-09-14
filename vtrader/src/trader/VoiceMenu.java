@@ -6,16 +6,16 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
@@ -34,6 +34,7 @@ import org.ta4j.core.indicators.adx.ADXIndicator;
 import org.ta4j.core.indicators.adx.MinusDIIndicator;
 import org.ta4j.core.indicators.adx.PlusDIIndicator;
 
+import com.dukascopy.api.Filter;
 import com.dukascopy.api.IBar;
 import com.dukascopy.api.ICurrency;
 import com.dukascopy.api.IEngine.OrderCommand;
@@ -55,7 +56,9 @@ class VoiceMenu  implements APICallback{
 	private static final int TYPE_BUY = 1;
 	private static final int TYPE_SELL = 2;
 	private static final int TYPE_HEDGE = 3;
-	private static final int MAX_DAYS_BACK = 60; // ~2 months
+	// how many daily candles F7 browses back over. The weekend filter drops days the market was
+	// shut, so these are trading days: 60 of them is about three months, not two.
+	private static final int MAX_DAYS_BACK = 60;
 	private static final int MAX_RISK_PERCENT = 200; // upper bound of the key 6 balance-usage percent
 	// F10 profit guarantee. Percentages follow the convention used everywhere else in this class:
 	// distance = price * percent / 100 / leverage.
@@ -78,8 +81,10 @@ class VoiceMenu  implements APICallback{
 	private ITick initTick; // last tick before user presses F1
 	private double openPrice;
 	private int idx = 0;
-	private int dayOffset = 0; // days back from today, used by F7 day browsing
+	private int dayOffset = 0; // trading days back from the most recent one, used by F7 day browsing
 	private DayStats currentDayStats; // stats for the day currently selected under F7
+	private List<IBar> dayBars; // daily candles behind F7, oldest first; loaded once per F7 press
+	private Instrument dayBarsInstrument; // the instrument dayBars was loaded for
 	private boolean shiftDown = false; // tracked manually: modifier bit on arrow-key events is unreliable on some setups
 	private boolean shiftUsedAsModifier = false; // true once Shift was combined with another key, to distinguish a plain Shift tap from Shift+arrow
 	private int rate = 25; // speech rate
@@ -737,6 +742,11 @@ class VoiceMenu  implements APICallback{
 					}
 					op = "days";
 					dayOffset = 0;
+					// a day may have passed, and today's candle is still growing, so start over
+					dayBars = null;
+					dayBarsInstrument = null;
+					// spoken over the one history call this costs; the day itself cuts it off
+					speak("Days, loading");
 					reportDay();
 					break;
 				case  KeyEvent.VK_F8:
@@ -872,7 +882,7 @@ class VoiceMenu  implements APICallback{
 					// rounding quantity to an int couldn't tell two nearby percents apart.
 					if (instrument.percent < 0)
 						instrument.percent = computeRiskPercent(instrument, askPrice, leverage);
-					int percent = instrument.percent + direction * 5;
+					int percent = instrument.percent + direction;
 					percent = Math.max(5, Math.min(MAX_RISK_PERCENT, percent));
 					instrument.percent = percent;
 					double balance = MyStrategy.getContext().getAccount().getBalance();
@@ -937,19 +947,13 @@ class VoiceMenu  implements APICallback{
 					));
 		}
 		else if (op.equals("days")) {
-			int step = -direction;
-			DayStats stats;
-			boolean moved;
-			do {
-				int prevOffset = dayOffset;
-				int candidate = dayOffset + step;
-				candidate = Math.max(0, Math.min(MAX_DAYS_BACK, candidate));
-				dayOffset = candidate;
-				moved = dayOffset != prevOffset;
-				stats = computeDayStats(dayOffset);
-			} while (moved && stats.hasData && stats.minPrice == stats.maxPrice);
-			currentDayStats = stats;
-			speakDayStats(stats);
+			// down steps back in time and up returns towards the latest day, as it always did. The
+			// list holds trading days only, so there is nothing to step over any more - the days
+			// the market was shut are simply not in it, and each one that is gets named out loud.
+			int last = Math.max(0, dayBarCount() - 1);
+			dayOffset = Math.max(0, Math.min(last, dayOffset - direction));
+			currentDayStats = computeDayStats(dayOffset);
+			speakDayStats(currentDayStats);
 		}
 		else if (op.equals("guarantee")) {
 			// two entries, and the cursor keys hand us steps of 1, 10 or a billion
@@ -1014,7 +1018,7 @@ class VoiceMenu  implements APICallback{
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
 	}
-	// derives the balance-usage percent (rounded to the nearest 5%, 5 to MAX_RISK_PERCENT) that a quantity
+	// derives the balance-usage percent (rounded to the nearest 1%, 5 to MAX_RISK_PERCENT) that a quantity
 	// corresponds to. Used to keep instrument.percent in sync whenever quantity is set some
 	// other way (key 5, or the initial seed the first time key 6 is used).
 	// quantity = (balance * percent/100) * leverage / askPrice, so percent is the inverse of that.
@@ -1023,7 +1027,7 @@ class VoiceMenu  implements APICallback{
 		if (balance <= 0 || askPrice <= 0 || leverage <= 0)
 			return 5;
 		double percent = instrument.quantity * askPrice / leverage / balance * 100.0;
-		int rounded = (int) (Math.round(percent / 5.0) * 5);
+		int rounded = (int) Math.round(percent);
 		return Math.max(5, Math.min(MAX_RISK_PERCENT, rounded));
 	}
 	private void reportRisk() {
@@ -1333,33 +1337,97 @@ class VoiceMenu  implements APICallback{
 		long minTime;
 		double maxPrice;
 		long maxTime;
+		long dayStart; // the daily candle's own start time, the baseline for loading intraday detail
+		boolean intradayLoaded; // minTime and maxTime are filled in on demand, by left and right
+	}
+
+	// The daily candles F7 browses. One history call covers the whole range, where a day at a time
+	// used to mean 288 five minute bars fetched on every arrow press. Filter.WEEKENDS asks the
+	// broker to leave out the days the market never opened, so what comes back is trading days only.
+	private List<IBar> getDayBars() {
+		Instrument instrument = instruments.get(selectedInstrument).getInstrument();
+		if (dayBars != null && instrument.equals(dayBarsInstrument))
+			return dayBars;
+		IHistory history = MyStrategy.getContext().getHistory();
+		try {
+			// counting candles back from the last one sidesteps day boundaries altogether: a daily
+			// candle opens at midnight UTC, which is not midnight here, and the arithmetic that
+			// used to bridge the two is what made whole days go missing
+			long lastBar = history.getBarStart(Period.DAILY, history.getLastTick(instrument).getTime());
+			dayBars = history.getBars(instrument, Period.DAILY, OfferSide.ASK, Filter.WEEKENDS,
+					MAX_DAYS_BACK, lastBar, 0);
+			dayBarsInstrument = instrument;
+		} catch (JFException e) {
+			e.printStackTrace();
+			dayBars = null;
+			dayBarsInstrument = null;
+		}
+		return dayBars;
+	}
+
+	private int dayBarCount() {
+		List<IBar> bars = getDayBars();
+		return (bars == null) ? 0 : bars.size();
+	}
+
+	// names a daily candle by the day it actually covers. The candle runs from midnight UTC, so it
+	// is read back in UTC too - deriving the name from the local clock instead is what let the
+	// spoken date drift away from the prices being spoken with it.
+	private String formatDayName(long barTime) {
+		// the locale is pinned: everything else here is spoken in English, and the day and month
+		// names would otherwise follow whatever regional setting the machine happens to carry
+		return ZonedDateTime.ofInstant(Instant.ofEpochMilli(barTime), ZoneOffset.UTC)
+				.format(DateTimeFormatter.ofPattern("EEEE, MMMM d", Locale.ENGLISH));
 	}
 
 	private DayStats computeDayStats(int offset) {
 		DayStats stats = new DayStats();
-		ZoneId zone = ZoneId.systemDefault();
-		ZonedDateTime dayStart = ZonedDateTime.now(zone).truncatedTo(ChronoUnit.DAYS).minusDays(offset);
-		stats.dayName = dayStart.format(DateTimeFormatter.ofPattern("MMMM d"));
+		List<IBar> bars = getDayBars();
+		if (bars == null || bars.isEmpty()) {
+			stats.dayName = "No days loaded";
+			stats.hasData = false;
+			return stats;
+		}
+		// offset counts back from the latest day, which is the last candle in the list
+		int index = bars.size() - 1 - offset;
+		if (index < 0 || index >= bars.size()) {
+			stats.dayName = "That day";
+			stats.hasData = false;
+			return stats;
+		}
+		IBar bar = bars.get(index);
+		stats.dayStart = bar.getTime();
+		stats.dayName = formatDayName(bar.getTime());
+		stats.hasData = true;
+		stats.minPrice = bar.getLow();
+		stats.maxPrice = bar.getHigh();
+		return stats;
+	}
 
+	// A daily candle knows what the day's low and high were, but not when they happened. Left and
+	// right ask for exactly that, so the five minute bars are fetched here and only here - once for
+	// each day the user actually asks about, instead of once for every day browsed past.
+	private void loadIntradayTimes(DayStats stats) {
+		if (stats.intradayLoaded || !stats.hasData)
+			return;
+		stats.intradayLoaded = true; // one attempt per day, whether or not it finds anything
 		Instrument instrument = instruments.get(selectedInstrument).getInstrument();
 		IHistory history = MyStrategy.getContext().getHistory();
-
-		long startTime = dayStart.toInstant().toEpochMilli();
-		long rawEndTime = Math.min(dayStart.plusDays(1).toInstant().toEpochMilli(), System.currentTimeMillis());
-
 		try {
-			// the current day's end time is "now", which falls mid-bar; align it to
-			// the start of the last completed 5 min bar, or getBars() rejects the interval
-			long endTime = history.getPreviousBarStart(Period.FIVE_MINS, rawEndTime);
-			if (endTime < startTime) {
-				stats.hasData = false;
-				return stats;
-			}
-			List<IBar> bars = history.getBars(instrument, Period.FIVE_MINS, OfferSide.ASK, startTime, endTime);
-			if (bars.isEmpty()) {
-				stats.hasData = false;
-				return stats;
-			}
+			long from = history.getBarStart(Period.FIVE_MINS, stats.dayStart);
+			// today's candle is still open, and "now" falls mid-bar; align the end to the last
+			// completed 5 min bar, or getBars() rejects the interval
+			long rawEnd = Math.min(stats.dayStart + 24 * 3600 * 1000L, System.currentTimeMillis());
+			long to = history.getPreviousBarStart(Period.FIVE_MINS, rawEnd);
+			if (to < from)
+				return;
+			// the same weekend filter the daily candle was built with. Without it the market breaks
+			// inside the day come back as flat bars, and one of those can carry the day's own high
+			// or low - which would pin the announced time to a minute nothing actually traded in.
+			List<IBar> bars = history.getBars(instrument, Period.FIVE_MINS, OfferSide.ASK,
+					Filter.WEEKENDS, from, to);
+			if (bars.isEmpty())
+				return;
 			IBar minBar = bars.get(0);
 			IBar maxBar = bars.get(0);
 			for (IBar bar : bars) {
@@ -1368,16 +1436,13 @@ class VoiceMenu  implements APICallback{
 				if (bar.getHigh() > maxBar.getHigh())
 					maxBar = bar;
 			}
-			stats.hasData = true;
-			stats.minPrice = minBar.getLow();
+			// the prices stay the daily candle's own: those are what was already announced, and
+			// only the timing is being filled in here
 			stats.minTime = minBar.getTime();
-			stats.maxPrice = maxBar.getHigh();
 			stats.maxTime = maxBar.getTime();
 		} catch (JFException e) {
 			e.printStackTrace();
-			stats.hasData = false;
 		}
-		return stats;
 	}
 
 	private void speakDayStats(DayStats stats) {
@@ -1386,11 +1451,12 @@ class VoiceMenu  implements APICallback{
 			speak(stats.dayName + ". No data.");
 			return;
 		}
+		// no times here: they cost a second history call, and left and right are what ask for them
 		speak(String.format(
-				"%s. Min: %s at %s. Max: %s at %s.",
+				"%s. Min: %s. Max: %s.",
 				stats.dayName,
-				formatPrice(stats.minPrice, false, mi), MyUtils.formatTime(stats.minTime),
-				formatPrice(stats.maxPrice, false, mi), MyUtils.formatTime(stats.maxTime)
+				formatPrice(stats.minPrice, false, mi),
+				formatPrice(stats.maxPrice, false, mi)
 				));
 	}
 
@@ -1405,7 +1471,10 @@ class VoiceMenu  implements APICallback{
 			return;
 		}
 		MyInstrument mi = instruments.get(selectedInstrument);
-		speak(String.format("Min: %s at %s", formatPrice(currentDayStats.minPrice, false, mi), MyUtils.formatTime(currentDayStats.minTime)));
+		loadIntradayTimes(currentDayStats);
+		speak(String.format("Min: %s%s",
+				formatPrice(currentDayStats.minPrice, false, mi),
+				timeSuffix(currentDayStats.minTime)));
 	}
 
 	private void speakDayMax() {
@@ -1414,7 +1483,15 @@ class VoiceMenu  implements APICallback{
 			return;
 		}
 		MyInstrument mi = instruments.get(selectedInstrument);
-		speak(String.format("Max: %s at %s", formatPrice(currentDayStats.maxPrice, false, mi), MyUtils.formatTime(currentDayStats.maxTime)));
+		loadIntradayTimes(currentDayStats);
+		speak(String.format("Max: %s%s",
+				formatPrice(currentDayStats.maxPrice, false, mi),
+				timeSuffix(currentDayStats.maxTime)));
+	}
+
+	// " at 14:35", or nothing at all when the intraday bars could not say when it happened
+	private String timeSuffix(long time) {
+		return (time > 0) ? " at " + MyUtils.formatTime(time) : "";
 	}
 
 	// the long form used by F8 only: for prices above 1000 the fractional part carries no
