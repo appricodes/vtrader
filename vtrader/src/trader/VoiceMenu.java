@@ -1,6 +1,4 @@
 package trader;
-import java.awt.event.KeyAdapter;
-import java.awt.event.KeyEvent;
 import java.io.File;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -21,8 +19,12 @@ import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-import javax.swing.JFrame;
-import javax.swing.JTextField;
+import org.eclipse.swt.SWT;
+import org.eclipse.swt.events.KeyAdapter;
+import org.eclipse.swt.events.KeyEvent;
+import org.eclipse.swt.widgets.Display;
+import org.eclipse.swt.widgets.Shell;
+import org.eclipse.swt.widgets.Text;
 
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -60,16 +62,25 @@ class VoiceMenu  implements APICallback{
 	// shut, so these are trading days: 60 of them is about three months, not two.
 	private static final int MAX_DAYS_BACK = 60;
 	private static final int MAX_RISK_PERCENT = 200; // upper bound of the key 6 balance-usage percent
-	// F10 profit guarantee. Percentages follow the convention used everywhere else in this class:
+	// Profit guarantee. Percentages follow the convention used everywhere else in this class:
 	// distance = price * percent / 100 / leverage.
-	private static final int GUARANTEE_INSTANT = 0;
-	private static final int GUARANTEE_CONDITIONAL = 1;
+	static final int GUARANTEE_INSTANT = 0;
+	static final int GUARANTEE_CONDITIONAL = 1;
+	// what the F10 window opens on the first time. After that the window remembers what was last
+	// used, for the rest of the session.
 	private static final double GUARANTEE_SL_PERCENT = 2;
-	private static final double GUARANTEE_TP_PERCENT = 50;
 	private static final long GUARANTEE_RETRY_MS = 5000; // pause after the broker refuses a stop
-	// F11 reverse guard, same percent convention as above
+	// Deliberately not a setting in the window, and deliberately re-sent with every stop the
+	// guarantee moves. The target is not a target: it is parked out of reach so the trailing stop is
+	// the only thing that can close the position. Left alone it could be moved by hand on the
+	// platform - by accident, most likely - and the position would close there instead, which is the
+	// one thing the guarantee exists to prevent.
+	private static final double GUARANTEE_TP_PERCENT = 50;
+	// Reverse guard, same percent convention as above
 	private static final double REVERSE_TRIGGER_PERCENT = 5; // adverse move that opens the reverse position
 	private static final double REVERSE_LOCK_PERCENT = 50; // stop and target both sides get once hedged
+	private static final double REVERSE_SLIPPAGE_PERCENT = 0.02; // allowed when opening the reverse position
+	private static final double REVERSE_SURVIVOR_STOP_PERCENT = 50; // share of the original stop distance the survivor keeps
 
 	private static VoiceMenu instance;
 
@@ -98,15 +109,34 @@ class VoiceMenu  implements APICallback{
 	// armed conditional SL/TP updates, one per order, watched against live ticks in checkPendingConditionalUpdate
 	private List<PendingConditionalUpdate> pendingConditionalUpdates = new ArrayList<>();
 
-	// F10 profit guarantee: trailing stops armed on open positions, advanced in checkProfitGuarantees.
+	// profit guarantee: trailing stops armed on open positions, advanced in checkProfitGuarantees.
 	// Copy-on-write because the key handler adds from the event thread while onTick iterates.
-	private IOrder pendingGuaranteeOrder; // order selected via F2, targeted by F10
-	private int guaranteeChoice = GUARANTEE_INSTANT;
 	private final List<ProfitGuarantee> profitGuarantees = new CopyOnWriteArrayList<>();
 
-	// F11 reverse guards, advanced in checkReverseGuards
-	private IOrder pendingReverseOrder; // order selected via F2, targeted by F11
+	// reverse guards, advanced in checkReverseGuards
 	private final List<ReverseGuard> reverseGuards = new CopyOnWriteArrayList<>();
+
+	// F10: the position picked with F2, and where the spoken action menu currently stands
+	private IOrder pendingActionOrder;
+	private int actionChoice = ActionDialog.ACTION_GUARANTEE;
+
+	// What the action window opens on. Touched only from the SWT thread - the window writes them
+	// when the user arms something, and reads them the next time it opens. The values a guard
+	// actually runs on are copied onto the guard itself at arming time, so changing these here never
+	// reaches back into something already armed.
+	int guaranteeMode = GUARANTEE_INSTANT;
+	double guaranteeSlPercent = GUARANTEE_SL_PERCENT;
+	long guaranteeRetryMs = GUARANTEE_RETRY_MS;
+	double reverseTriggerPercent = REVERSE_TRIGGER_PERCENT;
+	double reverseLockPercent = REVERSE_LOCK_PERCENT;
+	double reverseSlippagePercent = REVERSE_SLIPPAGE_PERCENT;
+	double reverseSurvivorStopPercent = REVERSE_SURVIVOR_STOP_PERCENT;
+
+	// the key-capturing window and its text field, kept so the action window can parent itself and
+	// hand the focus back on the way out
+	private Shell shell;
+	private Text textField;
+
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
 	private List<String> textList = new ArrayList<String>();
@@ -149,21 +179,31 @@ class VoiceMenu  implements APICallback{
 	class ReverseGuard {
 		final IOrder original;
 		final double threshold; // adverse price distance from the open price that fires the guard
-		final double originalStopDistance; // the stop distance the position had before F11, halved later
+		final double originalStopDistance; // the stop distance the position had when the guard was set
+		// the settings this guard was armed with. Copied here rather than read back off VoiceMenu,
+		// because the tick thread and the broker's executor run these long after the window that
+		// chose them has gone, and the next window may well choose something else.
+		final double lockPercent;
+		final double slippagePercent;
+		final double survivorStopPercent; // share of originalStopDistance the survivor's stop keeps
 		IOrder reverse; // the opposite position, once it exists
 		volatile boolean hedged; // the reverse position was opened; the guard never fires again
 		volatile boolean firing; // an order submission or modification is with the broker
 
-		ReverseGuard(IOrder original, double threshold, double originalStopDistance) {
+		ReverseGuard(IOrder original, double threshold, double originalStopDistance,
+				double lockPercent, double slippagePercent, double survivorStopPercent) {
 			this.original = original;
 			this.threshold = threshold;
 			this.originalStopDistance = originalStopDistance;
+			this.lockPercent = lockPercent;
+			this.slippagePercent = slippagePercent;
+			this.survivorStopPercent = survivorStopPercent;
 		}
 	}
 
-	// opens the opposite position and pushes both sides' stop and target out to REVERSE_LOCK_PERCENT
-	// of the price at this moment. The reverse goes in first: if it cannot be opened the original is
-	// left exactly as it was, rather than sitting on a 50 percent stop with nothing hedging it.
+	// opens the opposite position and pushes both sides' stop and target out to the guard's lock
+	// percent of the price at this moment. The reverse goes in first: if it cannot be opened the
+	// original is left exactly as it was, rather than sitting on a far stop with nothing hedging it.
 	class ReverseTask implements Callable<Boolean> {
 		final ReverseGuard guard;
 		final ITick tick;
@@ -180,12 +220,12 @@ class VoiceMenu  implements APICallback{
 			String label = original.getLabel();
 			try {
 				double price = original.isLong() ? tick.getBid() : tick.getAsk();
-				double distance = price * REVERSE_LOCK_PERCENT / 100.0 / instrument.getLeverageUse();
+				double distance = price * guard.lockPercent / 100.0 / instrument.getLeverageUse();
 				double pip = instrument.getPipValue();
 				boolean reverseLong = !original.isLong();
 
 				try {
-					double slippage = price * 0.0002 / pip;
+					double slippage = price * guard.slippagePercent / 100.0 / pip;
 					guard.reverse = MyStrategy.getContext().getEngine().submitOrder(
 							label + "R",
 							instrument,
@@ -237,8 +277,8 @@ class VoiceMenu  implements APICallback{
 		}
 	}
 
-	// one side is gone: the survivor's stop goes half the original position's own stop distance away
-	// from the price the other side closed at
+	// one side is gone: the survivor's stop goes the guard's survivor stop share of the original
+	// position's own stop distance away from the price the other side closed at
 	class ReverseAdjustTask implements Callable<Boolean> {
 		final ReverseGuard guard;
 		final IOrder survivor;
@@ -254,13 +294,13 @@ class VoiceMenu  implements APICallback{
 		public Boolean call() {
 			try {
 				if (guard.originalStopDistance <= 0) {
-					speak("One side closed, but the original position had no stop loss to halve. The stop of "
+					speak("One side closed, but the original position had no stop loss to measure from. The stop of "
 							+ survivor.getLabel() + " is unchanged.");
 					return false;
 				}
-				double half = guard.originalStopDistance / 2;
+				double part = guard.originalStopDistance * guard.survivorStopPercent / 100.0;
 				double pip = survivor.getInstrument().getPipValue();
-				double stop = roundToPip(survivor.isLong() ? basePrice - half : basePrice + half, pip);
+				double stop = roundToPip(survivor.isLong() ? basePrice - part : basePrice + part, pip);
 				try {
 					survivor.setStopLossPrice(stop);
 				} catch (JFException e) {
@@ -281,6 +321,11 @@ class VoiceMenu  implements APICallback{
 
 	class ProfitGuarantee {
 		final IOrder order;
+		// the settings this guarantee was armed with, copied here for the same reason ReverseGuard
+		// copies its own: the trailing runs on the tick thread long after the window has closed.
+		// The take profit percent is not among them - it is fixed at GUARANTEE_TP_PERCENT.
+		final double slPercent;
+		final long retryMs;
 		double triggerPrice;   // conditional mode: price the order's take profit was set to
 		boolean trailing;      // false while a conditional guarantee still waits for its trigger
 		double stopPrice;      // last stop we asked the broker for; only ever tightens
@@ -289,10 +334,13 @@ class VoiceMenu  implements APICallback{
 		volatile boolean stopFailed; // last stop was refused; retry even when it looks no better
 		volatile long retryAfter; // do not send another modification before this time
 
-		ProfitGuarantee(IOrder order, boolean conditional, double triggerPrice) {
+		ProfitGuarantee(IOrder order, boolean conditional, double triggerPrice,
+				double slPercent, long retryMs) {
 			this.order = order;
 			this.trailing = !conditional;
 			this.triggerPrice = triggerPrice;
+			this.slPercent = slPercent;
+			this.retryMs = retryMs;
 		}
 	}
 
@@ -336,11 +384,11 @@ class VoiceMenu  implements APICallback{
 					} catch (JFException e) {
 						e.printStackTrace();
 						ok = false;
-						// 2% can fall inside the broker's minimum stop distance. stopPrice now holds a
-						// level the broker never accepted, so the usual "is this tighter" test would
-						// block every retry - stopFailed forces one, and retryAfter paces it.
+						// a small percent can fall inside the broker's minimum stop distance. stopPrice
+						// now holds a level the broker never accepted, so the usual "is this tighter"
+						// test would block every retry - stopFailed forces one, and retryAfter paces it.
 						guarantee.stopFailed = true;
-						guarantee.retryAfter = System.currentTimeMillis() + GUARANTEE_RETRY_MS;
+						guarantee.retryAfter = System.currentTimeMillis() + guarantee.retryMs;
 						if (!guarantee.rejected) {
 							guarantee.rejected = true;
 							speak("Broker refused the stop loss on " + label
@@ -530,282 +578,295 @@ class VoiceMenu  implements APICallback{
 		MyUtils.filePutContents(file, id + "");
 		return id;
 	}
-	private void speak(String text) {
+	void speak(String text) {
 		Main.speak(text, rate);
 	}
 	public void start() {
 		speak("Connecting, please wait.");
-		JFrame frame = new JFrame("Voice Trader");
-		frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-		frame.setSize(300, 100);
+		// SWT's Display must be created on, and pumped from, the thread that owns it - it cannot
+		// share the main thread, which goes on to connect and start the strategy right after this
+		// call returns. So the shell and its dispatch loop live on a dedicated UI thread; every
+		// handler below only touches VoiceMenu's own fields and thread-safe collections, exactly as
+		// it did under Swing, so none of that needs to change.
+		Thread uiThread = new Thread(() -> {
+			Display display = new Display();
+			shell = new Shell(display);
+			shell.setText("Voice Trader");
+			shell.setSize(300, 100);
+			shell.setLayout(null);
+			// exiting the whole app when this window closes matches the old JFrame.EXIT_ON_CLOSE
+			shell.addListener(SWT.Close, e -> System.exit(0));
 
-		// Create a text field to capture focus
-		JTextField textField = new JTextField();
-		textField.setEditable(false);
-		frame.add(textField);
+			// Create a text field to capture focus
+			textField = new Text(shell, SWT.SINGLE | SWT.READ_ONLY);
+			textField.setBounds(10, 10, 260, 30);
 
-		// Add a KeyListener to the text field
-		textField.addKeyListener(new KeyAdapter() {
-			@Override
-			public void keyReleased(KeyEvent e) {
-				if (e.getKeyCode() == KeyEvent.VK_SHIFT) {
-					shiftDown = false;
-					// a plain tap of Shift (not combined with another key) switches to messages, as before
-					if (!shiftUsedAsModifier) {
-						op = "messages";
-						idx = MyStrategy.messages.size() - 1;
-						reportMessage();
+			// Add a KeyListener to the text field
+			textField.addKeyListener(new KeyAdapter() {
+				@Override
+				public void keyReleased(KeyEvent e) {
+					if (e.keyCode == SWT.SHIFT) {
+						shiftDown = false;
+						// a plain tap of Shift (not combined with another key) switches to messages, as before
+						if (!shiftUsedAsModifier) {
+							op = "messages";
+							idx = MyStrategy.messages.size() - 1;
+							reportMessage();
+						}
+						shiftUsedAsModifier = false;
 					}
-					shiftUsedAsModifier = false;
 				}
-			}
-			@Override
-			public void keyPressed(KeyEvent e) {
-				//public void keyReleased(KeyEvent e) {
-				switch(e.getKeyCode()) {
-				case  KeyEvent.VK_UP:
-				case  KeyEvent.VK_DOWN:
-				case  KeyEvent.VK_PAGE_UP:
-				case  KeyEvent.VK_PAGE_DOWN:
-				case  KeyEvent.VK_HOME:
-				case  KeyEvent.VK_END: {
-					// shift held while navigating means "announce the full price instead of the short one"
-					boolean shift = shiftDown || e.isShiftDown();
-					if (shift)
-						shiftUsedAsModifier = true;
-					int step;
-					switch (e.getKeyCode()) {
-					case KeyEvent.VK_UP:        step = 1; break;
-					case KeyEvent.VK_DOWN:      step = -1; break;
-					case KeyEvent.VK_PAGE_UP:   step = 10; break;
-					case KeyEvent.VK_PAGE_DOWN: step = -10; break;
-					case KeyEvent.VK_HOME:      step = 1000000000; break;
-					default:                    step = -1000000000; break;
-					}
-					processCursor(step, shift);
-					break;
-				}
-				case  KeyEvent.VK_1:
-					// instrument selection
-					op = "instrument";
-					reportInstrument();
-					break;
-				case  KeyEvent.VK_2:
-					reportPrice(TYPE_SELL, false, instruments.get(selectedInstrument));
-					break;
-				case  KeyEvent.VK_LEFT:
-					if (op.equals("open") && !isDirectionSelected)
-						adjustOpenPrice(-1);
-					else if (op.equals("days"))
-						speakDayMin();
-					else if (op.equals("update_sl_tp"))
-						adjustUpdateTarget(-1);
-					else {
-						boolean shift = shiftDown || e.isShiftDown();
+				@Override
+				public void keyPressed(KeyEvent e) {
+					//public void keyReleased(KeyEvent e) {
+					switch(e.keyCode) {
+					case  SWT.ARROW_UP:
+					case  SWT.ARROW_DOWN:
+					case  SWT.PAGE_UP:
+					case  SWT.PAGE_DOWN:
+					case  SWT.HOME:
+					case  SWT.END: {
+						// shift held while navigating means "announce the full price instead of the short one"
+						boolean shift = shiftDown || (e.stateMask & SWT.SHIFT) != 0;
 						if (shift)
 							shiftUsedAsModifier = true;
-						reportPrice(TYPE_SELL, !shift, instruments.get(selectedInstrument));
-					}
-					break;
-				case  KeyEvent.VK_RIGHT:
-					if (op.equals("open") && !isDirectionSelected)
-						adjustOpenPrice(1);
-					else if (op.equals("days"))
-						speakDayMax();
-					else if (op.equals("update_sl_tp"))
-						adjustUpdateTarget(1);
-					else {
-						boolean shift = shiftDown || e.isShiftDown();
-						if (shift)
-							shiftUsedAsModifier = true;
-						reportPrice(TYPE_BUY, !shift, instruments.get(selectedInstrument));
-					}
-					break;
-				case  KeyEvent.VK_3: {
-					boolean shift = shiftDown || e.isShiftDown();
-					if (shift) {
-						shiftUsedAsModifier = true;
-						reportPotential(true);
-					}
-					else {
-						op = "slp";
-						reportSLP();
-					}
-					break;
-				}
-				case  KeyEvent.VK_4: {
-					boolean shift = shiftDown || e.isShiftDown();
-					if (shift) {
-						shiftUsedAsModifier = true;
-						reportPotential(false);
-					}
-					else {
-						op = "tpp";
-						reportTPP();
-					}
-					break;
-				}
-				case  KeyEvent.VK_5:
-					op = "quantity";
-					reportQuantity();
-					break;
-				case  KeyEvent.VK_6:
-					op = "risk";
-					reportRisk();
-					break;
-				case  KeyEvent.VK_F2:
-					reportOpenOrders();
-					break;
-				case  KeyEvent.VK_F3:
-					if (op.equals("open_orders")) {
-						if (openOrders.isEmpty()) {
-							speak("No open positions");
-							break;
+						int step;
+						switch (e.keyCode) {
+						case SWT.ARROW_UP:   step = 1; break;
+						case SWT.ARROW_DOWN: step = -1; break;
+						case SWT.PAGE_UP:    step = 10; break;
+						case SWT.PAGE_DOWN:  step = -10; break;
+						case SWT.HOME:       step = 1000000000; break;
+						default:             step = -1000000000; break;
 						}
-						op = "close_order";
-						IOrder order = openOrders.get(idx);
-						speak(String.format(
-								"Close %s order %s with profit: %s? Press space to confirm.",
-								(order.isLong()) ? "buy" : "sell",
-										order.getLabel(),
-										formatPrice(order.getProfitLossInAccountCurrency())
-								));
-					}
-					break;
-				case  KeyEvent.VK_F4:
-					if (op.equals("open_orders")) {
-						if (openOrders.isEmpty()) {
-							speak("No open positions");
-							break;
-						}
-						op = "update_sl_tp";
-						IOrder order = openOrders.get(idx);
-						pendingUpdateOrder = order;
-						updateInitTick = getLastTick(order.getInstrument());
-						updateTargetLevel = 0;
-						speak(String.format(
-								"Update stop loss and take profit of %s order %s, to: %s%%, and %s%%? Press enter to confirm now, or use left and right to set a target price.",
-								(order.isLong()) ? "buy" : "sell",
-										order.getLabel(),
-										formatPrice(instruments.get(selectedInstrument).slp),
-										formatPrice(instruments.get(selectedInstrument).tpp)
-								));
-					}
-					break;
-				case  KeyEvent.VK_Q:
-					reportClosedOrders();
-					break;
-				case  KeyEvent.VK_W:
-					reportAccount();
-					break;
-				case  KeyEvent.VK_F1:
-					op = "open";
-					openType = TYPE_NONE;
-					initTick = getLastTick(instruments.get(selectedInstrument).getInstrument());
-					openPrice = (initTick.getAsk() + initTick.getBid()) /2;
-					isDirectionSelected = false;
-					
-					speak("Open new position");
-					break;
-				case  KeyEvent.VK_SHIFT:
-					shiftDown = true;
-					break;
-				case  KeyEvent.VK_CAPS_LOCK:
-					processRate();
-					break;
-				case  KeyEvent.VK_SPACE:
-				case  KeyEvent.VK_ENTER:
-					processConfirm();
-					op = "";
-					break;
-				case  KeyEvent.VK_A:
-					op = "voice";
-					speak("Voice");
-					break;
-				case  KeyEvent.VK_ESCAPE:
-					op = "";
-					speak("Cancelled");
-					break;
-				case  KeyEvent.VK_CONTROL:
-					speak("");
-					break;
-				case  KeyEvent.VK_F5:
-					reportHistory(Period.FIVE_MINS);
-					break;
-				case  KeyEvent.VK_F6:
-					reportHistory(Period.ONE_HOUR);
-					break;
-				case  KeyEvent.VK_F7:
-					if (MyStrategy.getContext() == null) {
-						speak("Please wait");
+						processCursor(step, shift);
 						break;
 					}
-					op = "days";
-					dayOffset = 0;
-					// a day may have passed, and today's candle is still growing, so start over
-					dayBars = null;
-					dayBarsInstrument = null;
-					// spoken over the one history call this costs; the day itself cuts it off
-					speak("Days, loading");
-					reportDay();
-					break;
-				case  KeyEvent.VK_F8:
-					reportPeaks();
-					break;
-				case  KeyEvent.VK_F9:
-					if (op.equals("open")) {
-						openType = TYPE_HEDGE;
+					case  '1':
+						// instrument selection
+						op = "instrument";
+						reportInstrument();
+						break;
+					case  '2':
+						reportPrice(TYPE_SELL, false, instruments.get(selectedInstrument));
+						break;
+					case  SWT.ARROW_LEFT:
+						if (op.equals("open") && !isDirectionSelected)
+							adjustOpenPrice(-1);
+						else if (op.equals("days"))
+							speakDayMin();
+						else if (op.equals("update_sl_tp"))
+							adjustUpdateTarget(-1);
+						else {
+							boolean shift = shiftDown || (e.stateMask & SWT.SHIFT) != 0;
+							if (shift)
+								shiftUsedAsModifier = true;
+							reportPrice(TYPE_SELL, !shift, instruments.get(selectedInstrument));
+						}
+						break;
+					case  SWT.ARROW_RIGHT:
+						if (op.equals("open") && !isDirectionSelected)
+							adjustOpenPrice(1);
+						else if (op.equals("days"))
+							speakDayMax();
+						else if (op.equals("update_sl_tp"))
+							adjustUpdateTarget(1);
+						else {
+							boolean shift = shiftDown || (e.stateMask & SWT.SHIFT) != 0;
+							if (shift)
+								shiftUsedAsModifier = true;
+							reportPrice(TYPE_BUY, !shift, instruments.get(selectedInstrument));
+						}
+						break;
+					case  '3': {
+						boolean shift = shiftDown || (e.stateMask & SWT.SHIFT) != 0;
+						if (shift) {
+							shiftUsedAsModifier = true;
+							reportPotential(true);
+						}
+						else {
+							op = "slp";
+							reportSLP();
+						}
+						break;
+					}
+					case  '4': {
+						boolean shift = shiftDown || (e.stateMask & SWT.SHIFT) != 0;
+						if (shift) {
+							shiftUsedAsModifier = true;
+							reportPotential(false);
+						}
+						else {
+							op = "tpp";
+							reportTPP();
+						}
+						break;
+					}
+					case  '5':
+						op = "quantity";
+						reportQuantity();
+						break;
+					case  '6':
+						op = "risk";
+						reportRisk();
+						break;
+					case  SWT.F2:
+						reportOpenOrders();
+						break;
+					case  SWT.F3:
+						if (op.equals("open_orders")) {
+							if (openOrders.isEmpty()) {
+								speak("No open positions");
+								break;
+							}
+							op = "close_order";
+							IOrder order = openOrders.get(idx);
+							speak(String.format(
+									"Close %s order %s with profit: %s? Press space to confirm.",
+									(order.isLong()) ? "buy" : "sell",
+											order.getLabel(),
+											formatPrice(order.getProfitLossInAccountCurrency())
+									));
+						}
+						break;
+					case  SWT.F4:
+						if (op.equals("open_orders")) {
+							if (openOrders.isEmpty()) {
+								speak("No open positions");
+								break;
+							}
+							op = "update_sl_tp";
+							IOrder order = openOrders.get(idx);
+							pendingUpdateOrder = order;
+							updateInitTick = getLastTick(order.getInstrument());
+							updateTargetLevel = 0;
+							speak(String.format(
+									"Update stop loss and take profit of %s order %s, to: %s%%, and %s%%? Press enter to confirm now, or use left and right to set a target price.",
+									(order.isLong()) ? "buy" : "sell",
+											order.getLabel(),
+											formatPrice(instruments.get(selectedInstrument).slp),
+											formatPrice(instruments.get(selectedInstrument).tpp)
+									));
+						}
+						break;
+					case  'q':
+						reportClosedOrders();
+						break;
+					case  'w':
+						reportAccount();
+						break;
+					case  SWT.F1:
+						op = "open";
+						openType = TYPE_NONE;
+						initTick = getLastTick(instruments.get(selectedInstrument).getInstrument());
+						openPrice = (initTick.getAsk() + initTick.getBid()) /2;
 						isDirectionSelected = false;
-						speak("Hedging mode");
-					}
-					break;
-				case  KeyEvent.VK_F10:
-					if (op.equals("open_orders")) {
-						if (openOrders.isEmpty()) {
-							speak("No open positions");
+
+						speak("Open new position");
+						break;
+					case  SWT.SHIFT:
+						shiftDown = true;
+						break;
+					case  SWT.CAPS_LOCK:
+						processRate();
+						break;
+					case  ' ':
+					case  SWT.CR:
+						processConfirm();
+						op = "";
+						break;
+					case  'a':
+						op = "voice";
+						speak("Voice");
+						break;
+					case  SWT.ESC:
+						op = "";
+						speak("Cancelled");
+						break;
+					case  SWT.CTRL:
+						speak("");
+						break;
+					case  SWT.F5:
+						reportHistory(Period.FIVE_MINS);
+						break;
+					case  SWT.F6:
+						reportHistory(Period.ONE_HOUR);
+						break;
+					case  SWT.F7:
+						if (MyStrategy.getContext() == null) {
+							speak("Please wait");
 							break;
 						}
-						op = "guarantee";
-						pendingGuaranteeOrder = openOrders.get(idx);
-						guaranteeChoice = GUARANTEE_INSTANT;
-						// one speak() per announcement: each call cuts the previous one off
-						speak(String.format(
-								"Profit guarantee for %s order %s. Use up and down to choose. %s",
-								pendingGuaranteeOrder.isLong() ? "buy" : "sell",
-								pendingGuaranteeOrder.getLabel(),
-								guaranteeChoiceText()
-								));
-					}
-					else
-						speak("Select a position first, by pressing F2.");
-					break;
-				case  KeyEvent.VK_F11:
-					if (op.equals("open_orders")) {
-						if (openOrders.isEmpty()) {
-							speak("No open positions");
-							break;
+						op = "days";
+						dayOffset = 0;
+						// a day may have passed, and today's candle is still growing, so start over
+						dayBars = null;
+						dayBarsInstrument = null;
+						// spoken over the one history call this costs; the day itself cuts it off
+						speak("Days, loading");
+						reportDay();
+						break;
+					case  SWT.F8:
+						reportPeaks();
+						break;
+					case  SWT.F9:
+						if (op.equals("open")) {
+							openType = TYPE_HEDGE;
+							isDirectionSelected = false;
+							speak("Hedging mode");
 						}
-						op = "reverse_guard";
-						pendingReverseOrder = openOrders.get(idx);
-						speak(String.format(
-								"Reverse guard on %s order %s. If it loses %d percent, an opposite position opens. Press space to confirm.",
-								pendingReverseOrder.isLong() ? "buy" : "sell",
-								pendingReverseOrder.getLabel(),
-								(int) REVERSE_TRIGGER_PERCENT
-								));
+						break;
+					case  SWT.F10:
+						// the one way in to both guards: pick the action here, and the window that
+						// opens on enter carries the explanation and every setting it needs
+						if (op.equals("open_orders")) {
+							if (openOrders.isEmpty()) {
+								speak("No open positions");
+								break;
+							}
+							op = "action_menu";
+							pendingActionOrder = openOrders.get(idx);
+							actionChoice = ActionDialog.ACTION_GUARANTEE;
+							// one speak() per announcement: each call cuts the previous one off
+							speak(String.format(
+									"Actions for %s order %s. Use up and down to choose, then press enter. %s",
+									pendingActionOrder.isLong() ? "buy" : "sell",
+									pendingActionOrder.getLabel(),
+									ActionDialog.ACTION_NAMES[actionChoice]
+									));
+						}
+						else
+							speak("Select a position first, by pressing F2.");
+						break;
+					case  SWT.F11:
+						// the shortcut it always was, straight to the reverse guard's own window
+						if (op.equals("open_orders")) {
+							if (openOrders.isEmpty()) {
+								speak("No open positions");
+								break;
+							}
+							openActionDialog(openOrders.get(idx), ActionDialog.ACTION_REVERSE);
+						}
+						else
+							speak("Select a position first, by pressing F2.");
+						break;
+					case  SWT.F12:
+						speak(MyUtils.formatTime(System.currentTimeMillis()));
+						break;
 					}
-					else
-						speak("Select a position first, by pressing F2.");
-					break;
-				case  KeyEvent.VK_F12:
-					speak(MyUtils.formatTime(System.currentTimeMillis()));
-					break;
 				}
+			});
+
+			shell.open();
+			textField.setFocus();
+			while (!shell.isDisposed()) {
+				if (!display.readAndDispatch())
+					display.sleep();
 			}
-		});
-
-		frame.setVisible(true);
-
+			display.dispose();
+		}, "VoiceMenu-SWT");
+		uiThread.setDaemon(true);
+		uiThread.start();
 	}
 	private void processCursor(int direction, boolean shift) {
 		// instrument sellection
@@ -955,11 +1016,11 @@ class VoiceMenu  implements APICallback{
 			currentDayStats = computeDayStats(dayOffset);
 			speakDayStats(currentDayStats);
 		}
-		else if (op.equals("guarantee")) {
-			// two entries, and the cursor keys hand us steps of 1, 10 or a billion
-			guaranteeChoice += Integer.signum(direction);
-			guaranteeChoice = Math.max(GUARANTEE_INSTANT, Math.min(GUARANTEE_CONDITIONAL, guaranteeChoice));
-			speak(guaranteeChoiceText());
+		else if (op.equals("action_menu")) {
+			// a short list, and the cursor keys hand us steps of 1, 10 or a billion
+			actionChoice += Integer.signum(direction);
+			actionChoice = Math.max(0, Math.min(ActionDialog.ACTION_NAMES.length - 1, actionChoice));
+			speak(ActionDialog.ACTION_NAMES[actionChoice]);
 		}
 		else if (op.equals("messages")) {
 			idx += direction;
@@ -1117,17 +1178,30 @@ class VoiceMenu  implements APICallback{
 				speak("Will update stop loss and take profit when price reaches " + formatPrice(updateTargetPrice));
 			}
 		}
-		else if (op.equals("guarantee")) {
-			if (pendingGuaranteeOrder == null)
+		else if (op.equals("action_menu")) {
+			if (pendingActionOrder == null)
 				return;
-			armProfitGuarantee(pendingGuaranteeOrder, guaranteeChoice);
-		}
-		else if (op.equals("reverse_guard")) {
-			if (pendingReverseOrder == null)
-				return;
-			armReverseGuard(pendingReverseOrder);
+			openActionDialog(pendingActionOrder, actionChoice);
 		}
 
+	}
+	// opens the window for one action on one position. Called on the SWT thread, from a key handler,
+	// and returns straight away: the window is a child of the main shell, so the dispatch loop
+	// already running in start() pumps its events too. Nothing is armed until its button is pressed.
+	private void openActionDialog(IOrder order, int action) {
+		if (MyStrategy.getContext() == null) {
+			speak("Please wait");
+			return;
+		}
+		op = "";
+		pendingActionOrder = null;
+		new ActionDialog(shell, this, action, order).open();
+	}
+	// the action window hands the focus back here on its way out; without it the key field behind it
+	// is left unfocused and none of the keys below do anything
+	void focusKeyField() {
+		if (textField != null && !textField.isDisposed())
+			textField.setFocus();
 	}
 	private void reportOpenOrders() {
 		if (MyStrategy.getContext() != null) {
@@ -1764,10 +1838,11 @@ class VoiceMenu  implements APICallback{
 		return Math.round(rounded * 1000000) / 1000000.0;
 	}
 
-	// F11: watches one position and, the first time it is more than REVERSE_TRIGGER_PERCENT under
-	// water, opens the opposite position of the same size. Fires once and once only - after that the
-	// guard exists just to set the surviving side's stop when the other one goes.
-	private void armReverseGuard(IOrder order) {
+	// watches one position and, the first time it is more than triggerPercent under water, opens the
+	// opposite position of the same size. Fires once and once only - after that the guard exists just
+	// to set the surviving side's stop when the other one goes.
+	void armReverseGuard(IOrder order, double triggerPercent, double lockPercent,
+			double slippagePercent, double survivorStopPercent) {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait");
 			return;
@@ -1779,19 +1854,21 @@ class VoiceMenu  implements APICallback{
 				return;
 			}
 		}
-		// the distance to halve later is the one the position has now, before the guard moves anything
+		// the distance to take a share of later is the one the position has now, before the guard
+		// moves anything
 		double stopLoss = order.getStopLossPrice();
 		double stopDistance = (stopLoss > 0) ? Math.abs(order.getOpenPrice() - stopLoss) : 0;
-		double threshold = order.getOpenPrice() * REVERSE_TRIGGER_PERCENT / 100.0
+		double threshold = order.getOpenPrice() * triggerPercent / 100.0
 				/ order.getInstrument().getLeverageUse();
-		reverseGuards.add(new ReverseGuard(order, threshold, stopDistance));
-		// the guard only ever fires if the position survives long enough to get there. With every
+		reverseGuards.add(new ReverseGuard(order, threshold, stopDistance,
+				lockPercent, slippagePercent, survivorStopPercent));
+		// the guard only ever fires if the position survives long enough to get there. With an
 		// instrument configured at slp 5 and the trigger also at 5 percent, the two land on the same
 		// price and the broker's stop wins, so this is worth saying out loud rather than leaving the
 		// guard to sit there doing nothing.
 		String warning = "";
 		if (stopDistance <= 0)
-			warning = " It has no stop loss, so nothing can be halved when one side closes later.";
+			warning = " It has no stop loss, so there is no distance to measure from when one side closes later.";
 		else if (stopDistance <= threshold)
 			warning = " Warning: its own stop loss is at or inside the trigger, so it will close before"
 					+ " the reverse position can open. Widen the stop loss first.";
@@ -1853,12 +1930,6 @@ class VoiceMenu  implements APICallback{
 		}
 	}
 
-	private String guaranteeChoiceText() {
-		if (guaranteeChoice == GUARANTEE_INSTANT)
-			return "Instant guarantee: stop loss at 2 percent, following the price. Press enter to confirm.";
-		return "Conditional guarantee: wait for the take profit price, then follow the price. Press enter to confirm.";
-	}
-
 	// a level 'percent' away from the current price, on the profitable or the losing side of the
 	// order. Same distance convention as the rest of the class: price * percent / 100 / leverage.
 	private double guaranteeLevel(IOrder order, ITick tick, double percent, boolean profitable) {
@@ -1872,11 +1943,11 @@ class VoiceMenu  implements APICallback{
 		return Math.round(price * 1000000) / 1000000.0;
 	}
 
-	// F10: puts a trailing stop on an already-open position. The instant mode starts trailing at
-	// once; the conditional mode waits for the price the order's take profit was set to. Both push
-	// the real take profit far out of reach, so the broker cannot close the position there and the
-	// exit stays with the trailing stop.
-	private void armProfitGuarantee(IOrder order, int choice) {
+	// puts a trailing stop on an already-open position. The instant mode starts trailing at once;
+	// the conditional mode waits for the price the order's take profit was set to. Both push the
+	// real take profit far out of reach, so the broker cannot close the position there and the exit
+	// stays with the trailing stop.
+	void armProfitGuarantee(IOrder order, int choice, double slPercent, long retryMs) {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait");
 			return;
@@ -1896,14 +1967,15 @@ class VoiceMenu  implements APICallback{
 
 		String label = order.getLabel();
 		profitGuarantees.removeIf(p -> p.order.getLabel().equals(label));
-		ProfitGuarantee g = new ProfitGuarantee(order, choice == GUARANTEE_CONDITIONAL, triggerPrice);
+		ProfitGuarantee g = new ProfitGuarantee(order, choice == GUARANTEE_CONDITIONAL, triggerPrice,
+				slPercent, retryMs);
 		profitGuarantees.add(g);
 
 		double takeProfit = guaranteeLevel(order, tick, GUARANTEE_TP_PERCENT, true);
 		if (choice == GUARANTEE_INSTANT) {
 			// placed unconditionally, even when it tightens an existing stop or locks in a loss:
-			// the point of the instant mode is "from here on I lose no more than 2 percent"
-			double stop = guaranteeLevel(order, tick, GUARANTEE_SL_PERCENT, false);
+			// the point of the instant mode is "from here on I lose no more than this percent"
+			double stop = guaranteeLevel(order, tick, g.slPercent, false);
 			g.stopPrice = stop;
 			submitGuarantee(g, stop, takeProfit);
 			speak(String.format("Instant guarantee on %s. Stop loss %s.", label, formatPrice(stop)));
@@ -1940,14 +2012,15 @@ class VoiceMenu  implements APICallback{
 				if (!reached)
 					continue;
 				g.trailing = true;
-				double stop = guaranteeLevel(g.order, tick, GUARANTEE_SL_PERCENT, false);
+				double stop = guaranteeLevel(g.order, tick, g.slPercent, false);
 				g.stopPrice = stop;
-				submitGuarantee(g, stop, Double.NaN);
+				// the target goes out with it, and with every stop after this one: see below
+				submitGuarantee(g, stop, guaranteeLevel(g.order, tick, GUARANTEE_TP_PERCENT, true));
 				speak(String.format("Target reached on %s. Stop loss %s.", g.order.getLabel(), formatPrice(stop)));
 				continue;
 			}
 
-			double stop = guaranteeLevel(g.order, tick, GUARANTEE_SL_PERCENT, false);
+			double stop = guaranteeLevel(g.order, tick, g.slPercent, false);
 			// the stop only ever tightens - higher for a long, lower for a short. When the price moves
 			// against us the new level is worse than the one we hold, and we leave it alone. After a
 			// refusal there is nothing holding at all, so retry regardless.
@@ -1955,7 +2028,11 @@ class VoiceMenu  implements APICallback{
 			if (!better && !g.stopFailed)
 				continue;
 			g.stopPrice = stop;
-			submitGuarantee(g, stop, Double.NaN);
+			// The target is pushed out again every single time the stop moves, rather than being set
+			// once when the guarantee was armed. Two reasons: it has to stay out of reach as the
+			// price runs, and anything that moved it in the meantime - a hand on the platform, most
+			// likely - is put back where it belongs at the next tick that moves the stop.
+			submitGuarantee(g, stop, guaranteeLevel(g.order, tick, GUARANTEE_TP_PERCENT, true));
 		}
 	}
 
