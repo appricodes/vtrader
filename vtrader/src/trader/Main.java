@@ -63,6 +63,11 @@ public class Main {
 	private static int lightReconnects = 3;
 
 	public static void main(String[] args) throws Exception {
+		// first thing of all: PowerShell needs about three seconds to come up, and starting it here
+		// means it is sitting in its read loop long before anything is ready to be spoken
+		Speaker.start();
+		Runtime.getRuntime().addShutdownHook(new Thread(Speaker::shutdown, "tts-shutdown"));
+
 		VoiceMenu menu = new VoiceMenu();
 		menu.start();
 
@@ -345,6 +350,7 @@ public class Main {
 			voice = voices.get(voiceId);
 			speechEngine.setVoice(voice.getName());
 			speechEngine.setRate(0);
+			Speaker.setVoice(voice.getName()); // the live host picks the same voice
 			return voice.getName();
 
 		} catch (SpeechEngineCreationException e) {
@@ -363,6 +369,11 @@ public class Main {
 	public static void speak(String text, int rate) {
 		if (speechEngine == null)
 			initSpeechEngine();
+		// the long-lived host, when it is there: one line down a pipe instead of a three second
+		// PowerShell launch. It cancels whatever is being said itself, so there is no stopTalking
+		// here - that call exists to kill the per utterance process the library would have started.
+		if (Speaker.say(text, rate))
+			return;
 		speechEngine.stopTalking();
 		speechEngine.setRate(rate);
 		try {
