@@ -857,8 +857,11 @@ class VoiceMenu  implements APICallback{
 			if (MyStrategy.getContext() != null) {
 				ITick tick = getLastTick(instrument.getInstrument());
 				double leverage = instrument.instrument.getLeverageUse();
-				if (tick != null && leverage > 0)
-					instrument.percent = computeRiskPercent(instrument, tick.getAsk(), leverage);
+				if (tick != null && leverage > 0) {
+					double rate = baseCurrencyRate(instrument);
+					if (rate > 0)
+						instrument.percent = computeRiskPercent(instrument, rate, leverage);
+				}
 			}
 			speak(String.format("%d", instrument.quantity));
 		}
@@ -874,18 +877,23 @@ class VoiceMenu  implements APICallback{
 					speak("Please wait.");
 				}
 				else {
-					double askPrice = tick.getAsk();
+					double baseRate = baseCurrencyRate(instrument);
+					if (baseRate <= 0) {
+						speak("Please wait.");
+						return;
+					}
 					// percent is stored directly on the instrument now, not re-derived from quantity
 					// each time - that round trip used to get stuck on high-priced instruments where
 					// rounding quantity to an int couldn't tell two nearby percents apart.
 					if (instrument.percent < 0)
-						instrument.percent = computeRiskPercent(instrument, askPrice, leverage);
+						instrument.percent = computeRiskPercent(instrument, baseRate, leverage);
 					int percent = instrument.percent + direction;
 					percent = Math.max(5, Math.min(MAX_RISK_PERCENT, percent));
 					instrument.percent = percent;
 					double balance = MyStrategy.getContext().getAccount().getBalance();
-					// percent of balance used as margin; quantity = margin * leverage / price
-					int newQuantity = (int) Math.round(balance * percent / 100.0 * leverage / askPrice);
+					// percent of balance used as margin, converted from account currency into the
+					// instrument's base currency: quantity = margin * leverage / baseRate
+					int newQuantity = (int) Math.round(balance * percent / 100.0 * leverage / baseRate);
 					if (newQuantity < 1)
 						newQuantity = 1;
 					instrument.quantity = newQuantity;
@@ -1016,15 +1024,35 @@ class VoiceMenu  implements APICallback{
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
 	}
+	// rate that turns 1 unit of the instrument's base (primary) currency into account currency - the
+	// quantity key 6 computes is a base-currency amount, but the balance it is sized from is in
+	// account currency, so this is what connects the two. 1 when the base currency already is the
+	// account currency (a USD/JPY position on a USD account: no conversion needed at all); the pair's
+	// own price when the account currency is the quote currency (EUR/USD on a USD account, where the
+	// ask price already is USD per EUR); and, for a cross pair involving neither, a rate the platform
+	// derives from other subscribed pairs. 0 if that rate could not be obtained, same meaning as a
+	// missing tick elsewhere in this class: not ready yet.
+	private double baseCurrencyRate(MyInstrument instrument) {
+		ICurrency base = instrument.instrument.getPrimaryJFCurrency();
+		ICurrency account = MyStrategy.getContext().getAccount().getAccountCurrency();
+		if (base.getCurrencyCode().equals(account.getCurrencyCode()))
+			return 1;
+		try {
+			return MyStrategy.getContext().getUtils().getRate(base, account, OfferSide.ASK);
+		} catch (JFException e) {
+			e.printStackTrace();
+			return 0;
+		}
+	}
 	// derives the balance-usage percent (rounded to the nearest 1%, 5 to MAX_RISK_PERCENT) that a quantity
 	// corresponds to. Used to keep instrument.percent in sync whenever quantity is set some
 	// other way (key 5, or the initial seed the first time key 6 is used).
-	// quantity = (balance * percent/100) * leverage / askPrice, so percent is the inverse of that.
-	private int computeRiskPercent(MyInstrument instrument, double askPrice, double leverage) {
+	// quantity = (balance * percent/100) * leverage / baseRate, so percent is the inverse of that.
+	private int computeRiskPercent(MyInstrument instrument, double baseRate, double leverage) {
 		double balance = MyStrategy.getContext().getAccount().getBalance();
-		if (balance <= 0 || askPrice <= 0 || leverage <= 0)
+		if (balance <= 0 || baseRate <= 0 || leverage <= 0)
 			return 5;
-		double percent = instrument.quantity * askPrice / leverage / balance * 100.0;
+		double percent = instrument.quantity * baseRate / leverage / balance * 100.0;
 		int rounded = (int) Math.round(percent);
 		return Math.max(5, Math.min(MAX_RISK_PERCENT, rounded));
 	}
@@ -1042,7 +1070,12 @@ class VoiceMenu  implements APICallback{
 				speak("Please wait.");
 				return;
 			}
-			instrument.percent = computeRiskPercent(instrument, tick.getAsk(), leverage);
+			double rate = baseCurrencyRate(instrument);
+			if (rate <= 0) {
+				speak("Please wait.");
+				return;
+			}
+			instrument.percent = computeRiskPercent(instrument, rate, leverage);
 		}
 		speak(String.format("Risk %d%%, quantity %d", instrument.percent, instrument.quantity));
 	}
