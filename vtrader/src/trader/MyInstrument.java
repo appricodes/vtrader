@@ -54,6 +54,11 @@ class MyInstrument {
 	// F10 profit guarantee trailing-stop distance, percent (key 7). Read once when a guarantee is
 	// armed and kept on the guard itself, so changing this afterwards only affects the next arm.
 	public double gsp;
+	// Shift+F10 reverse guard: adverse-move trigger percent (key 8) and the stop/target lock percent
+	// both sides get once hedged (key 9). Both are read once when the guard is armed and kept on it,
+	// so changing these afterwards only affects the next arm.
+	public double rtp;
+	public double rlp;
 	public int quantity;
 	// % of balance used as margin (key 6, risk mode). Stored directly instead of re-derived from
 	// quantity each time, so repeated up/down presses don't get stuck on high-priced instruments
@@ -90,6 +95,8 @@ class MyInstrument {
 		this.slp = Double.parseDouble(prop.getProperty("slp", "5").trim());
 		this.tpp = Double.parseDouble(prop.getProperty("tpp", "20").trim());
 		this.gsp = Double.parseDouble(prop.getProperty("gsp", "2").trim());
+		this.rtp = Double.parseDouble(prop.getProperty("rtp", "5").trim());
+		this.rlp = Double.parseDouble(prop.getProperty("rlp", "50").trim());
 		this.quantity = Integer.parseInt(prop.getProperty("quantity", "20").trim());
 		this.digits = Integer.parseInt(prop.getProperty("digits", "20").trim());
 		this.skipDigits = Integer.parseInt(prop.getProperty("skip_digits", "20").trim());

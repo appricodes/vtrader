@@ -69,7 +69,9 @@ class VoiceMenu  implements APICallback{
 	private static final double GUARANTEE_SL_PERCENT = 2;
 	private static final double GUARANTEE_TP_PERCENT = 50;
 	private static final long GUARANTEE_RETRY_MS = 5000; // pause after the broker refuses a stop
-	// Shift+F10 reverse guard, same percent convention as above
+	// Shift+F10 reverse guard, same percent convention as above. Both are now per-instrument and
+	// key-8/key-9 adjustable (MyInstrument.rtp/rlp); these are only the fallback for the one case
+	// where an order's instrument settings cannot be found.
 	private static final double REVERSE_TRIGGER_PERCENT = 5; // adverse move that opens the reverse position
 	private static final double REVERSE_LOCK_PERCENT = 50; // stop and target both sides get once hedged
 
@@ -152,20 +154,24 @@ class VoiceMenu  implements APICallback{
 		final IOrder original;
 		final double threshold; // adverse price distance from the open price that fires the guard
 		final double originalStopDistance; // the stop distance the position had before the reverse guard, halved later
+		// lock percent (key 9), snapshotted at arm time: both sides' stop and target once hedged.
+		// A later key-9 change does not reach an already-armed guard, the same as the trigger above.
+		final double lockPercent;
 		IOrder reverse; // the opposite position, once it exists
 		volatile boolean hedged; // the reverse position was opened; the guard never fires again
 		volatile boolean firing; // an order submission or modification is with the broker
 
-		ReverseGuard(IOrder original, double threshold, double originalStopDistance) {
+		ReverseGuard(IOrder original, double threshold, double originalStopDistance, double lockPercent) {
 			this.original = original;
 			this.threshold = threshold;
 			this.originalStopDistance = originalStopDistance;
+			this.lockPercent = lockPercent;
 		}
 	}
 
-	// opens the opposite position and pushes both sides' stop and target out to REVERSE_LOCK_PERCENT
-	// of the price at this moment. The reverse goes in first: if it cannot be opened the original is
-	// left exactly as it was, rather than sitting on a 50 percent stop with nothing hedging it.
+	// opens the opposite position and pushes both sides' stop and target out to guard.lockPercent of
+	// the price at this moment. The reverse goes in first: if it cannot be opened the original is
+	// left exactly as it was, rather than sitting on a locked-in stop with nothing hedging it.
 	class ReverseTask implements Callable<Boolean> {
 		final ReverseGuard guard;
 		final ITick tick;
@@ -182,7 +188,7 @@ class VoiceMenu  implements APICallback{
 			String label = original.getLabel();
 			try {
 				double price = original.isLong() ? tick.getBid() : tick.getAsk();
-				double distance = price * REVERSE_LOCK_PERCENT / 100.0 / instrument.getLeverageUse();
+				double distance = price * guard.lockPercent / 100.0 / instrument.getLeverageUse();
 				double pip = instrument.getPipValue();
 				boolean reverseLong = !original.isLong();
 
@@ -508,6 +514,12 @@ class VoiceMenu  implements APICallback{
 				return mi;
 		return null;
 	}
+	private ReverseGuard findReverseGuard(String orderLabel) {
+		for (ReverseGuard g : reverseGuards)
+			if (g.original.getLabel().equals(orderLabel))
+				return g;
+		return null;
+	}
 	private ITick getLastTick(Instrument instrument) {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait.");
@@ -664,6 +676,14 @@ class VoiceMenu  implements APICallback{
 					op = "gsp";
 					reportGSP();
 					break;
+				case  KeyEvent.VK_8:
+					op = "rtp";
+					reportRTP();
+					break;
+				case  KeyEvent.VK_9:
+					op = "rlp";
+					reportRLP();
+					break;
 				case  KeyEvent.VK_F2:
 					reportOpenOrders();
 					break;
@@ -783,14 +803,33 @@ class VoiceMenu  implements APICallback{
 						break;
 					}
 					if (shift) {
-						op = "reverse_guard";
-						pendingReverseOrder = openOrders.get(idx);
-						speak(String.format(
-								"Reverse guard on %s order %s. If it loses %d percent, an opposite position opens. Press space to confirm.",
-								pendingReverseOrder.isLong() ? "buy" : "sell",
-								pendingReverseOrder.getLabel(),
-								(int) REVERSE_TRIGGER_PERCENT
-								));
+						IOrder selected = openOrders.get(idx);
+						ReverseGuard existing = findReverseGuard(selected.getLabel());
+						if (existing != null && !existing.hedged) {
+							// removal only makes sense before the reverse position exists - once hedged,
+							// taking the guard away leaves a pair of live positions with nothing watching them
+							op = "reverse_remove";
+							pendingReverseOrder = selected;
+							speak(String.format("Reverse guard already set on %s. Press space to remove it.",
+									selected.getLabel()));
+						}
+						else if (existing != null) {
+							speak(String.format(
+									"Reverse guard on %s already opened its reverse position. It cannot be removed this way.",
+									selected.getLabel()));
+						}
+						else {
+							op = "reverse_guard";
+							pendingReverseOrder = selected;
+							MyInstrument mi = findMyInstrument(selected.getInstrument());
+							double triggerPercent = mi != null ? mi.rtp : REVERSE_TRIGGER_PERCENT;
+							speak(String.format(
+									"Reverse guard on %s order %s. If it loses %s percent, an opposite position opens. Press space to confirm.",
+									selected.isLong() ? "buy" : "sell",
+									selected.getLabel(),
+									formatPrice(triggerPercent)
+									));
+						}
 					}
 					else {
 						op = "guarantee";
@@ -874,6 +913,40 @@ class VoiceMenu  implements APICallback{
 			instruments.get(selectedInstrument).gsp = gsp;
 
 			speak(formatPrice(instruments.get(selectedInstrument).gsp));
+		}
+		else if (op.equals("rtp")) {
+			// Shift+F10 reverse guard trigger percent. Only takes effect on the next guard armed on
+			// this instrument - an already-armed guard keeps the threshold it was armed with.
+			double rtp = instruments.get(selectedInstrument).rtp;
+			double x = rtp + direction / 10.0;
+			if (x < 5)
+				direction *= 2;
+			else
+				direction *= 5;
+			if (x >= 10)
+				direction *= 2;
+			rtp = Math.round(rtp*10 + direction) / 10.0;
+			rtp = Math.max(1, Math.min(100, rtp));
+			instruments.get(selectedInstrument).rtp = rtp;
+
+			speak(formatPrice(instruments.get(selectedInstrument).rtp));
+		}
+		else if (op.equals("rlp")) {
+			// Shift+F10 reverse guard lock percent, both sides' stop/target once hedged. Only takes
+			// effect on the next guard armed on this instrument, same as the trigger percent above.
+			double rlp = instruments.get(selectedInstrument).rlp;
+			double x = rlp + direction / 10.0;
+			if (x < 5)
+				direction *= 2;
+			else
+				direction *= 5;
+			if (x >= 10)
+				direction *= 2;
+			rlp = Math.round(rlp*10 + direction) / 10.0;
+			rlp = Math.max(1, Math.min(100, rlp));
+			instruments.get(selectedInstrument).rlp = rlp;
+
+			speak(formatPrice(instruments.get(selectedInstrument).rlp));
 		}
 		else if (op.equals("quantity")) {
 			MyInstrument instrument = instruments.get(selectedInstrument);
@@ -1054,6 +1127,14 @@ class VoiceMenu  implements APICallback{
 		double gsp = instruments.get(selectedInstrument).gsp;
 		speak(String.format("Guarantee trail %s%%", formatPrice(gsp)));
 	}
+	private void reportRTP() {
+		double rtp = instruments.get(selectedInstrument).rtp;
+		speak(String.format("Reverse trigger %s%%", formatPrice(rtp)));
+	}
+	private void reportRLP() {
+		double rlp = instruments.get(selectedInstrument).rlp;
+		speak(String.format("Reverse lock %s%%", formatPrice(rlp)));
+	}
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
 	}
@@ -1195,6 +1276,15 @@ class VoiceMenu  implements APICallback{
 			if (pendingReverseOrder == null)
 				return;
 			armReverseGuard(pendingReverseOrder);
+		}
+		else if (op.equals("reverse_remove")) {
+			if (pendingReverseOrder == null)
+				return;
+			String label = pendingReverseOrder.getLabel();
+			// re-check hedged here too: the guard could have fired between the key press and this
+			// confirm, and a hedged guard is not removable this way
+			boolean removed = reverseGuards.removeIf(g -> g.original.getLabel().equals(label) && !g.hedged);
+			speak(removed ? "Reverse guard removed from " + label + "." : "Nothing to remove.");
 		}
 
 	}
@@ -1833,27 +1923,26 @@ class VoiceMenu  implements APICallback{
 		return Math.round(rounded * 1000000) / 1000000.0;
 	}
 
-	// Shift+F10: watches one position and, the first time it is more than REVERSE_TRIGGER_PERCENT under
+	// Shift+F10: watches one position and, the first time it is more than the trigger percent under
 	// water, opens the opposite position of the same size. Fires once and once only - after that the
-	// guard exists just to set the surviving side's stop when the other one goes.
+	// guard exists just to set the surviving side's stop when the other one goes. Callers are
+	// expected to have already checked for an existing guard on this order (see the VK_F10 handler),
+	// since re-arming one is handled separately, by replacing it or offering to remove it.
 	private void armReverseGuard(IOrder order) {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait");
 			return;
 		}
 		String label = order.getLabel();
-		for (ReverseGuard g : reverseGuards) {
-			if (g.original.getLabel().equals(label)) {
-				speak("A reverse guard is already set on " + label);
-				return;
-			}
-		}
+		MyInstrument mi = findMyInstrument(order.getInstrument());
+		double triggerPercent = mi != null ? mi.rtp : REVERSE_TRIGGER_PERCENT;
+		double lockPercent = mi != null ? mi.rlp : REVERSE_LOCK_PERCENT;
 		// the distance to halve later is the one the position has now, before the guard moves anything
 		double stopLoss = order.getStopLossPrice();
 		double stopDistance = (stopLoss > 0) ? Math.abs(order.getOpenPrice() - stopLoss) : 0;
-		double threshold = order.getOpenPrice() * REVERSE_TRIGGER_PERCENT / 100.0
+		double threshold = order.getOpenPrice() * triggerPercent / 100.0
 				/ order.getInstrument().getLeverageUse();
-		reverseGuards.add(new ReverseGuard(order, threshold, stopDistance));
+		reverseGuards.add(new ReverseGuard(order, threshold, stopDistance, lockPercent));
 		// the guard only ever fires if the position survives long enough to get there. With every
 		// instrument configured at slp 5 and the trigger also at 5 percent, the two land on the same
 		// price and the broker's stop wins, so this is worth saying out loud rather than leaving the
