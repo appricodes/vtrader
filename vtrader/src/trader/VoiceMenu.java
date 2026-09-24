@@ -858,7 +858,7 @@ class VoiceMenu  implements APICallback{
 				ITick tick = getLastTick(instrument.getInstrument());
 				double leverage = instrument.instrument.getLeverageUse();
 				if (tick != null && leverage > 0) {
-					double rate = baseCurrencyRate(instrument);
+					double rate = baseCurrencyRate(instrument, tick.getAsk());
 					if (rate > 0)
 						instrument.percent = computeRiskPercent(instrument, rate, leverage);
 				}
@@ -877,7 +877,7 @@ class VoiceMenu  implements APICallback{
 					speak("Please wait.");
 				}
 				else {
-					double baseRate = baseCurrencyRate(instrument);
+					double baseRate = baseCurrencyRate(instrument, tick.getAsk());
 					if (baseRate <= 0) {
 						speak("Please wait.");
 						return;
@@ -1027,16 +1027,21 @@ class VoiceMenu  implements APICallback{
 	// rate that turns 1 unit of the instrument's base (primary) currency into account currency - the
 	// quantity key 6 computes is a base-currency amount, but the balance it is sized from is in
 	// account currency, so this is what connects the two. 1 when the base currency already is the
-	// account currency (a USD/JPY position on a USD account: no conversion needed at all); the pair's
-	// own price when the account currency is the quote currency (EUR/USD on a USD account, where the
-	// ask price already is USD per EUR); and, for a cross pair involving neither, a rate the platform
-	// derives from other subscribed pairs. 0 if that rate could not be obtained, same meaning as a
-	// missing tick elsewhere in this class: not ready yet.
-	private double baseCurrencyRate(MyInstrument instrument) {
+	// account currency (a USD/JPY position on a USD account: no conversion needed at all); askPrice,
+	// the instrument's own live tick, when the account currency is the quote currency (EUR/USD on a
+	// USD account, where the ask price already is USD per EUR - this is the common case and must
+	// come from the instrument's own tick, not a separate lookup, or it can disagree with the price
+	// the rest of this class is already using for the same instrument); and, for a cross pair
+	// involving neither, a rate the platform derives from other subscribed pairs. 0 if that rate
+	// could not be obtained, same meaning as a missing tick elsewhere in this class: not ready yet.
+	private double baseCurrencyRate(MyInstrument instrument, double askPrice) {
 		ICurrency base = instrument.instrument.getPrimaryJFCurrency();
+		ICurrency quote = instrument.instrument.getSecondaryJFCurrency();
 		ICurrency account = MyStrategy.getContext().getAccount().getAccountCurrency();
 		if (base.getCurrencyCode().equals(account.getCurrencyCode()))
 			return 1;
+		if (quote.getCurrencyCode().equals(account.getCurrencyCode()))
+			return askPrice;
 		try {
 			return MyStrategy.getContext().getUtils().getRate(base, account, OfferSide.ASK);
 		} catch (JFException e) {
@@ -1070,7 +1075,7 @@ class VoiceMenu  implements APICallback{
 				speak("Please wait.");
 				return;
 			}
-			double rate = baseCurrencyRate(instrument);
+			double rate = baseCurrencyRate(instrument, tick.getAsk());
 			if (rate <= 0) {
 				speak("Please wait.");
 				return;
