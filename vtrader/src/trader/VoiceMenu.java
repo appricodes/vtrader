@@ -64,6 +64,8 @@ class VoiceMenu  implements APICallback{
 	// distance = price * percent / 100 / leverage.
 	private static final int GUARANTEE_INSTANT = 0;
 	private static final int GUARANTEE_CONDITIONAL = 1;
+	// trailing-stop distance is now per-instrument and key-7 adjustable (MyInstrument.gsp); this is
+	// only the fallback for the one case where an order's instrument settings cannot be found.
 	private static final double GUARANTEE_SL_PERCENT = 2;
 	private static final double GUARANTEE_TP_PERCENT = 50;
 	private static final long GUARANTEE_RETRY_MS = 5000; // pause after the broker refuses a stop
@@ -284,15 +286,20 @@ class VoiceMenu  implements APICallback{
 		double triggerPrice;   // conditional mode: price the order's take profit was set to
 		boolean trailing;      // false while a conditional guarantee still waits for its trigger
 		double stopPrice;      // last stop we asked the broker for; only ever tightens
+		// trailing-stop distance, percent, snapshotted from the instrument's key-7 setting when this
+		// guard was armed (or re-armed). Later key-7 changes do not reach an already-armed guard -
+		// only re-arming it does, by replacing this field in place.
+		double slPercent;
 		volatile boolean inFlight; // a modification is with the broker; do not send another
 		volatile boolean rejected; // a rejection was already announced for this streak
 		volatile boolean stopFailed; // last stop was refused; retry even when it looks no better
 		volatile long retryAfter; // do not send another modification before this time
 
-		ProfitGuarantee(IOrder order, boolean conditional, double triggerPrice) {
+		ProfitGuarantee(IOrder order, boolean conditional, double triggerPrice, double slPercent) {
 			this.order = order;
 			this.trailing = !conditional;
 			this.triggerPrice = triggerPrice;
+			this.slPercent = slPercent;
 		}
 	}
 
@@ -653,6 +660,10 @@ class VoiceMenu  implements APICallback{
 					op = "risk";
 					reportRisk();
 					break;
+				case  KeyEvent.VK_7:
+					op = "gsp";
+					reportGSP();
+					break;
 				case  KeyEvent.VK_F2:
 					reportOpenOrders();
 					break;
@@ -842,9 +853,27 @@ class VoiceMenu  implements APICallback{
 			tpp = Math.round(tpp*10 + direction) / 10.0;
 			tpp = Math.max(1, Math.min(100, tpp));
 			instruments.get(selectedInstrument).tpp  = tpp;
-			
+
 			speak(formatPrice(instruments.get(selectedInstrument).tpp));
 
+		}
+		else if (op.equals("gsp")) {
+			// F10 profit guarantee trailing-stop distance. Only takes effect on the next guarantee
+			// armed on this instrument - an already-armed guard keeps trailing at the percent it
+			// was armed with, snapshotted on the ProfitGuarantee itself.
+			double gsp = instruments.get(selectedInstrument).gsp;
+			double x = gsp + direction / 10.0;
+			if (x < 5)
+				direction *= 2;
+			else
+				direction *= 5;
+			if (x >= 10)
+				direction *= 2;
+			gsp = Math.round(gsp*10 + direction) / 10.0;
+			gsp = Math.max(1, Math.min(100, gsp));
+			instruments.get(selectedInstrument).gsp = gsp;
+
+			speak(formatPrice(instruments.get(selectedInstrument).gsp));
 		}
 		else if (op.equals("quantity")) {
 			MyInstrument instrument = instruments.get(selectedInstrument);
@@ -1020,6 +1049,10 @@ class VoiceMenu  implements APICallback{
 	private void reportTPP() {
 		double tpp = instruments.get(selectedInstrument).tpp;
 		speak(String.format("Take profit %s%%", formatPrice(tpp)));
+	}
+	private void reportGSP() {
+		double gsp = instruments.get(selectedInstrument).gsp;
+		speak(String.format("Guarantee trail %s%%", formatPrice(gsp)));
 	}
 	private void reportQuantity() {
 		speak(String.format("Quantity %d", instruments.get(selectedInstrument).quantity));
@@ -1890,8 +1923,12 @@ class VoiceMenu  implements APICallback{
 	}
 
 	private String guaranteeChoiceText() {
+		MyInstrument mi = findMyInstrument(pendingGuaranteeOrder.getInstrument());
+		String percent = formatPrice(mi != null ? mi.gsp : GUARANTEE_SL_PERCENT);
 		if (guaranteeChoice == GUARANTEE_INSTANT)
-			return "Instant guarantee: stop loss at 2 percent, following the price. Press enter to confirm.";
+			return String.format(
+					"Instant guarantee: stop loss at %s percent, following the price. Press enter to confirm.",
+					percent);
 		return "Conditional guarantee: wait for the take profit price, then follow the price. Press enter to confirm.";
 	}
 
@@ -1917,6 +1954,21 @@ class VoiceMenu  implements APICallback{
 			speak("Please wait");
 			return;
 		}
+		String label = order.getLabel();
+		MyInstrument mi = findMyInstrument(order.getInstrument());
+		double slPercent = mi != null ? mi.gsp : GUARANTEE_SL_PERCENT;
+
+		// already guarded: re-arming replaces only the trailing-stop percent on the existing guard -
+		// not its stop price, not its trailing/conditional state. A fresh arm from scratch would
+		// hand back the ground the trailing stop already gave up.
+		for (ProfitGuarantee existing : profitGuarantees) {
+			if (existing.order.getLabel().equals(label)) {
+				existing.slPercent = slPercent;
+				speak(String.format("Guarantee on %s updated: %s percent.", label, formatPrice(slPercent)));
+				return;
+			}
+		}
+
 		ITick tick = getLastTick(order.getInstrument());
 		if (tick == null)
 			return;
@@ -1930,16 +1982,14 @@ class VoiceMenu  implements APICallback{
 			}
 		}
 
-		String label = order.getLabel();
-		profitGuarantees.removeIf(p -> p.order.getLabel().equals(label));
-		ProfitGuarantee g = new ProfitGuarantee(order, choice == GUARANTEE_CONDITIONAL, triggerPrice);
+		ProfitGuarantee g = new ProfitGuarantee(order, choice == GUARANTEE_CONDITIONAL, triggerPrice, slPercent);
 		profitGuarantees.add(g);
 
 		double takeProfit = guaranteeLevel(order, tick, GUARANTEE_TP_PERCENT, true);
 		if (choice == GUARANTEE_INSTANT) {
 			// placed unconditionally, even when it tightens an existing stop or locks in a loss:
-			// the point of the instant mode is "from here on I lose no more than 2 percent"
-			double stop = guaranteeLevel(order, tick, GUARANTEE_SL_PERCENT, false);
+			// the point of the instant mode is "from here on I lose no more than slPercent percent"
+			double stop = guaranteeLevel(order, tick, slPercent, false);
 			g.stopPrice = stop;
 			submitGuarantee(g, stop, takeProfit);
 			speak(String.format("Instant guarantee on %s. Stop loss %s.", label, formatPrice(stop)));
@@ -1976,14 +2026,15 @@ class VoiceMenu  implements APICallback{
 				if (!reached)
 					continue;
 				g.trailing = true;
-				double stop = guaranteeLevel(g.order, tick, GUARANTEE_SL_PERCENT, false);
+				double stop = guaranteeLevel(g.order, tick, g.slPercent, false);
+				double takeProfit = guaranteeLevel(g.order, tick, GUARANTEE_TP_PERCENT, true);
 				g.stopPrice = stop;
-				submitGuarantee(g, stop, Double.NaN);
+				submitGuarantee(g, stop, takeProfit);
 				speak(String.format("Target reached on %s. Stop loss %s.", g.order.getLabel(), formatPrice(stop)));
 				continue;
 			}
 
-			double stop = guaranteeLevel(g.order, tick, GUARANTEE_SL_PERCENT, false);
+			double stop = guaranteeLevel(g.order, tick, g.slPercent, false);
 			// the stop only ever tightens - higher for a long, lower for a short. When the price moves
 			// against us the new level is worse than the one we hold, and we leave it alone. After a
 			// refusal there is nothing holding at all, so retry regardless.
@@ -1991,7 +2042,10 @@ class VoiceMenu  implements APICallback{
 			if (!better && !g.stopFailed)
 				continue;
 			g.stopPrice = stop;
-			submitGuarantee(g, stop, Double.NaN);
+			// the take profit stays out at 50 percent of the current price, not the price at arm
+			// time - re-pushed with every stop move so a target moved by hand is put back too.
+			double takeProfit = guaranteeLevel(g.order, tick, GUARANTEE_TP_PERCENT, true);
+			submitGuarantee(g, stop, takeProfit);
 		}
 	}
 
