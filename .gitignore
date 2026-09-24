@@ -4,9 +4,3 @@ logs/
 
 # written when baseDir is unset; order logs, not source
 null/
-
-# TTS: the Replicate API token, and the generated audio cache
-vtrader/my_config/replicate_token.txt
-vtrader/tts_cache/
-# Piper voice models, downloaded on demand and far too large to track
-vtrader/tts_models/
