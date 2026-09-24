@@ -431,6 +431,98 @@ class VoiceMenu  implements APICallback{
 
 
 
+	// F8: pulls the last 12 hours of ticks for one instrument and finds its peaks and troughs.
+	// IHistory.getTicks blocks until all of it is loaded from the server, and 12 hours of raw ticks
+	// can be a lot of data - run off the event thread, like the other broker calls in this class, so
+	// the UI does not freeze while it waits. The instrument is captured at submit time rather than
+	// read again from selectedInstrument in here, since that could change while this is in flight.
+	class ReportPeaksTask implements Callable<Boolean> {
+		final MyInstrument mi;
+
+		ReportPeaksTask(MyInstrument mi) {
+			this.mi = mi;
+		}
+
+		@Override
+		public Boolean call() {
+			ITick lastTick;
+			List<ITick> ticks;
+			try {
+				lastTick = MyStrategy.getContext().getHistory().getLastTick(mi.getInstrument());
+				ticks = MyStrategy.getContext().getHistory().getTicks(
+						mi.getInstrument(),
+						lastTick.getTime() -12*3600*1000, lastTick.getTime());
+			} catch (JFException e) {
+				e.printStackTrace();
+				speak("Error");
+				op = "";
+				return false;
+			}
+			// convert to price time serrie
+			double[] signal = new double[ticks.size()];
+			for (int i=0; i<ticks.size(); i++)
+				signal[i] = (ticks.get(i).getBid() + ticks.get(i).getAsk()) / 2;
+
+			// find peaks
+			FindPeak fp = new FindPeak(signal);
+
+			Peak out = fp.detectPeaks();
+			int[] peaks = out.filterByProminence(lastTick.getBid() * 0.0010, 1000000.0);
+
+			Peak out2 = fp.detectTroughs();
+			int[] troughs = out2.filterByProminence(lastTick.getBid() * 0.0010, 1000000.0);
+
+			double pip = mi.instrument.getPipValue();
+
+			// combine them. Both maps are keyed by the same tick times, so the two lists stay
+			// index-aligned: plain cursor speaks the short price, shift speaks the full one.
+			Map<Long, String> all = new TreeMap<>();
+			Map<Long, String> allFull = new TreeMap<>();
+			for (int i: peaks) {
+				signal[i]  = Math.round(signal[i]/pip)*pip;
+				// remove trailing zeros which sometime apears
+				signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
+
+				long time = ticks.get(i).getTime();
+				all.put(time, String.format(
+						"Max: %s. at %s",
+						formatPrice(signal[i], true, mi),
+						MyUtils.formatTime(time)
+						));
+				allFull.put(time, String.format(
+						"Max: %s. at %s",
+						formatPeakPriceLong(signal[i]),
+						MyUtils.formatTime(time)
+						));
+			}
+
+			for (int i: troughs) {
+				signal[i]  = Math.round(signal[i]/pip)*pip;
+				// remove trailing zeros which sometime apears
+				signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
+
+				long time = ticks.get(i).getTime();
+				all.put(time, String.format(
+						"Min: %s. at %s",
+						formatPrice(signal[i], true, mi),
+						MyUtils.formatTime(time)
+						));
+				allFull.put(time, String.format(
+						"Min: %s. at %s",
+						formatPeakPriceLong(signal[i]),
+						MyUtils.formatTime(time)
+						));
+			}
+
+			textList = new ArrayList<String>(all.values());
+			textListFull = new ArrayList<String>(allFull.values());
+			op = "text_list";
+			idx = textList.size() - 1;
+			speak("Peaks ready");
+			return true;
+		}
+	}
+
 	public VoiceMenu() {
 		instance = this;
 		SineWaveGenerator generator = new SineWaveGenerator();
@@ -1668,82 +1760,10 @@ class VoiceMenu  implements APICallback{
 			return;
 		}
 		speak("Peaks, loading");
-		ITick lastTick;
-		List<ITick>  ticks;
-		try {
-			lastTick = MyStrategy.getContext().getHistory().getLastTick(instruments.get(selectedInstrument).getInstrument());
-			ticks = MyStrategy.getContext().getHistory().getTicks(
-					instruments.get(selectedInstrument).getInstrument(),
-					lastTick.getTime() -12*3600*1000, lastTick.getTime());
-		} catch (JFException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-			speak("Error");
-			op = "";
-			return;
-		}
-		// convert to price time serrie
-		double[] signal = new double[ticks.size()];
-		for (int i=0; i<ticks.size(); i++)
-			signal[i] = (ticks.get(i).getBid() + ticks.get(i).getAsk()) / 2;
-
-		// find peaks
-		FindPeak fp = new FindPeak(signal);
-
-		Peak out = fp.detectPeaks();
-		int[] peaks = out.filterByProminence(lastTick.getBid() * 0.0010, 1000000.0);
-
-		Peak out2 = fp.detectTroughs();
-		int[] troughs = out2.filterByProminence(lastTick.getBid() * 0.0010, 1000000.0);
-
-		double pip = instruments.get(selectedInstrument).instrument.getPipValue();
-		
-		// combine them. Both maps are keyed by the same tick times, so the two lists stay
-		// index-aligned: plain cursor speaks the short price, shift speaks the full one.
-		MyInstrument mi = instruments.get(selectedInstrument);
-		Map<Long, String> all = new TreeMap<>(); 
-		Map<Long, String> allFull = new TreeMap<>(); 
-		for (int i: peaks) {
-			signal[i]  = Math.round(signal[i]/pip)*pip;
-			// remove trailing zeros which sometime apears
-			signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
-
-			long time = ticks.get(i).getTime();
-			all.put(time, String.format(
-					"Max: %s. at %s",
-					formatPrice(signal[i], true, mi),
-					MyUtils.formatTime(time)
-					));
-			allFull.put(time, String.format(
-					"Max: %s. at %s",
-					formatPeakPriceLong(signal[i]),
-					MyUtils.formatTime(time)
-					));
-		}
-
-		for (int i: troughs) {
-			signal[i]  = Math.round(signal[i]/pip)*pip;
-			// remove trailing zeros which sometime apears
-			signal[i]   = Math.round(signal[i] * 1000000) / 1000000.0;
-
-			long time = ticks.get(i).getTime();
-			all.put(time, String.format(
-					"Min: %s. at %s",
-					formatPrice(signal[i], true, mi),
-					MyUtils.formatTime(time)
-					));
-			allFull.put(time, String.format(
-					"Min: %s. at %s",
-					formatPeakPriceLong(signal[i]),
-					MyUtils.formatTime(time)
-					));
-		}
-
-		textList = new ArrayList<String>(all.values());
-		textListFull = new ArrayList<String>(allFull.values());
-		op = "text_list";
-		idx = textList.size() - 1;
-		speak("Peaks ready");
+		// captured now, before handing off to the background thread: selectedInstrument could change
+		// while the fetch is still in flight, and the result must stay tied to the instrument it was
+		// asked for
+		MyStrategy.getContext().executeTask(new ReportPeaksTask(instruments.get(selectedInstrument)));
 	}
 	private JSONArray getJSONTicks(Instrument instrument, Long days) {
 		List<ITick> ticks = loadTicks(instrument, days);
