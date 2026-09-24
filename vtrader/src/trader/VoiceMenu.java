@@ -67,7 +67,7 @@ class VoiceMenu  implements APICallback{
 	private static final double GUARANTEE_SL_PERCENT = 2;
 	private static final double GUARANTEE_TP_PERCENT = 50;
 	private static final long GUARANTEE_RETRY_MS = 5000; // pause after the broker refuses a stop
-	// F11 reverse guard, same percent convention as above
+	// Shift+F10 reverse guard, same percent convention as above
 	private static final double REVERSE_TRIGGER_PERCENT = 5; // adverse move that opens the reverse position
 	private static final double REVERSE_LOCK_PERCENT = 50; // stop and target both sides get once hedged
 
@@ -104,8 +104,8 @@ class VoiceMenu  implements APICallback{
 	private int guaranteeChoice = GUARANTEE_INSTANT;
 	private final List<ProfitGuarantee> profitGuarantees = new CopyOnWriteArrayList<>();
 
-	// F11 reverse guards, advanced in checkReverseGuards
-	private IOrder pendingReverseOrder; // order selected via F2, targeted by F11
+	// Shift+F10 reverse guards, advanced in checkReverseGuards
+	private IOrder pendingReverseOrder; // order selected via F2, targeted by Shift+F10
 	private final List<ReverseGuard> reverseGuards = new CopyOnWriteArrayList<>();
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
@@ -149,7 +149,7 @@ class VoiceMenu  implements APICallback{
 	class ReverseGuard {
 		final IOrder original;
 		final double threshold; // adverse price distance from the open price that fires the guard
-		final double originalStopDistance; // the stop distance the position had before F11, halved later
+		final double originalStopDistance; // the stop distance the position had before the reverse guard, halved later
 		IOrder reverse; // the opposite position, once it exists
 		volatile boolean hedged; // the reverse position was opened; the guard never fires again
 		volatile boolean firing; // an order submission or modification is with the broker
@@ -759,12 +759,29 @@ class VoiceMenu  implements APICallback{
 						speak("Hedging mode");
 					}
 					break;
-				case  KeyEvent.VK_F10:
-					if (op.equals("open_orders")) {
-						if (openOrders.isEmpty()) {
-							speak("No open positions");
-							break;
-						}
+				case  KeyEvent.VK_F10: {
+					boolean shift = shiftDown || e.isShiftDown();
+					if (shift)
+						shiftUsedAsModifier = true;
+					if (!op.equals("open_orders")) {
+						speak("Select a position first, by pressing F2.");
+						break;
+					}
+					if (openOrders.isEmpty()) {
+						speak("No open positions");
+						break;
+					}
+					if (shift) {
+						op = "reverse_guard";
+						pendingReverseOrder = openOrders.get(idx);
+						speak(String.format(
+								"Reverse guard on %s order %s. If it loses %d percent, an opposite position opens. Press space to confirm.",
+								pendingReverseOrder.isLong() ? "buy" : "sell",
+								pendingReverseOrder.getLabel(),
+								(int) REVERSE_TRIGGER_PERCENT
+								));
+					}
+					else {
 						op = "guarantee";
 						pendingGuaranteeOrder = openOrders.get(idx);
 						guaranteeChoice = GUARANTEE_INSTANT;
@@ -776,27 +793,8 @@ class VoiceMenu  implements APICallback{
 								guaranteeChoiceText()
 								));
 					}
-					else
-						speak("Select a position first, by pressing F2.");
 					break;
-				case  KeyEvent.VK_F11:
-					if (op.equals("open_orders")) {
-						if (openOrders.isEmpty()) {
-							speak("No open positions");
-							break;
-						}
-						op = "reverse_guard";
-						pendingReverseOrder = openOrders.get(idx);
-						speak(String.format(
-								"Reverse guard on %s order %s. If it loses %d percent, an opposite position opens. Press space to confirm.",
-								pendingReverseOrder.isLong() ? "buy" : "sell",
-								pendingReverseOrder.getLabel(),
-								(int) REVERSE_TRIGGER_PERCENT
-								));
-					}
-					else
-						speak("Select a position first, by pressing F2.");
-					break;
+				}
 				case  KeyEvent.VK_F12:
 					speak(MyUtils.formatTime(System.currentTimeMillis()));
 					break;
@@ -1764,7 +1762,7 @@ class VoiceMenu  implements APICallback{
 		return Math.round(rounded * 1000000) / 1000000.0;
 	}
 
-	// F11: watches one position and, the first time it is more than REVERSE_TRIGGER_PERCENT under
+	// Shift+F10: watches one position and, the first time it is more than REVERSE_TRIGGER_PERCENT under
 	// water, opens the opposite position of the same size. Fires once and once only - after that the
 	// guard exists just to set the surviving side's stop when the other one goes.
 	private void armReverseGuard(IOrder order) {
