@@ -64,14 +64,13 @@ class VoiceMenu  implements APICallback{
 	// distance = price * percent / 100 / leverage.
 	private static final int GUARANTEE_INSTANT = 0;
 	private static final int GUARANTEE_CONDITIONAL = 1;
-	// trailing-stop distance is now per-instrument and key-7 adjustable (MyInstrument.gsp); this is
-	// only the fallback for the one case where an order's instrument settings cannot be found.
+	private static final int GUARANTEE_REVERSE = 2; // third F10 menu choice: arm/remove the reverse guard
+	// default trailing-stop distance (key 7, global for every instrument - see the gsp field below)
 	private static final double GUARANTEE_SL_PERCENT = 2;
 	private static final double GUARANTEE_TP_PERCENT = 50;
 	private static final long GUARANTEE_RETRY_MS = 5000; // pause after the broker refuses a stop
-	// Shift+F10 reverse guard, same percent convention as above. Both are now per-instrument and
-	// key-8/key-9 adjustable (MyInstrument.rtp/rlp); these are only the fallback for the one case
-	// where an order's instrument settings cannot be found.
+	// Reverse guard, the F10 menu's third choice, same percent convention as above. Defaults for the
+	// key-8/key-9 adjustable trigger and lock percents, global for every instrument (rtp/rlp below).
 	private static final double REVERSE_TRIGGER_PERCENT = 5; // adverse move that opens the reverse position
 	private static final double REVERSE_LOCK_PERCENT = 50; // stop and target both sides get once hedged
 
@@ -92,6 +91,10 @@ class VoiceMenu  implements APICallback{
 	private boolean shiftDown = false; // tracked manually: modifier bit on arrow-key events is unreliable on some setups
 	private boolean shiftUsedAsModifier = false; // true once Shift was combined with another key, to distinguish a plain Shift tap from Shift+arrow
 	private int rate = 25; // speech rate
+	// F10 menu percentages (keys 7/8/9), global for every instrument rather than set separately per one
+	private double gsp = GUARANTEE_SL_PERCENT; // profit guarantee trailing-stop percent
+	private double rtp = REVERSE_TRIGGER_PERCENT; // reverse guard trigger percent
+	private double rlp = REVERSE_LOCK_PERCENT; // reverse guard lock percent
 
 	// F4 stop loss / take profit update: target price selection state
 	private IOrder pendingUpdateOrder; // order selected via F2, targeted by F4
@@ -104,12 +107,11 @@ class VoiceMenu  implements APICallback{
 
 	// F10 profit guarantee: trailing stops armed on open positions, advanced in checkProfitGuarantees.
 	// Copy-on-write because the key handler adds from the event thread while onTick iterates.
-	private IOrder pendingGuaranteeOrder; // order selected via F2, targeted by F10
+	private IOrder pendingGuaranteeOrder; // order selected via F2, targeted by F10's 3-choice menu
 	private int guaranteeChoice = GUARANTEE_INSTANT;
 	private final List<ProfitGuarantee> profitGuarantees = new CopyOnWriteArrayList<>();
 
-	// Shift+F10 reverse guards, advanced in checkReverseGuards
-	private IOrder pendingReverseOrder; // order selected via F2, targeted by Shift+F10
+	// reverse guards, the F10 menu's third choice (GUARANTEE_REVERSE), advanced in checkReverseGuards
 	private final List<ReverseGuard> reverseGuards = new CopyOnWriteArrayList<>();
 	private List<IOrder> openOrders;
 	private List<IReportPosition>  closedOrders = new ArrayList<IReportPosition>();
@@ -705,12 +707,24 @@ class VoiceMenu  implements APICallback{
 					reportPrice(TYPE_SELL, false, instruments.get(selectedInstrument));
 					break;
 				case  KeyEvent.VK_LEFT:
-					if (op.equals("open") && !isDirectionSelected)
-						adjustOpenPrice(-1);
-					else if (op.equals("days"))
-						speakDayMin();
-					else if (op.equals("update_sl_tp"))
-						adjustUpdateTarget(-1);
+					if (op.equals("open") && !isDirectionSelected) {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						adjustOpenPrice(-1, !shift);
+					}
+					else if (op.equals("days")) {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						speakDayMin(!shift);
+					}
+					else if (op.equals("update_sl_tp")) {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						adjustUpdateTarget(-1, !shift);
+					}
 					else {
 						boolean shift = shiftDown || e.isShiftDown();
 						if (shift)
@@ -719,12 +733,24 @@ class VoiceMenu  implements APICallback{
 					}
 					break;
 				case  KeyEvent.VK_RIGHT:
-					if (op.equals("open") && !isDirectionSelected)
-						adjustOpenPrice(1);
-					else if (op.equals("days"))
-						speakDayMax();
-					else if (op.equals("update_sl_tp"))
-						adjustUpdateTarget(1);
+					if (op.equals("open") && !isDirectionSelected) {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						adjustOpenPrice(1, !shift);
+					}
+					else if (op.equals("days")) {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						speakDayMax(!shift);
+					}
+					else if (op.equals("update_sl_tp")) {
+						boolean shift = shiftDown || e.isShiftDown();
+						if (shift)
+							shiftUsedAsModifier = true;
+						adjustUpdateTarget(1, !shift);
+					}
 					else {
 						boolean shift = shiftDown || e.isShiftDown();
 						if (shift)
@@ -894,47 +920,18 @@ class VoiceMenu  implements APICallback{
 						speak("No open positions");
 						break;
 					}
-					if (shift) {
-						IOrder selected = openOrders.get(idx);
-						ReverseGuard existing = findReverseGuard(selected.getLabel());
-						if (existing != null && !existing.hedged) {
-							// removal only makes sense before the reverse position exists - once hedged,
-							// taking the guard away leaves a pair of live positions with nothing watching them
-							op = "reverse_remove";
-							pendingReverseOrder = selected;
-							speak(String.format("Reverse guard already set on %s. Press space to remove it.",
-									selected.getLabel()));
-						}
-						else if (existing != null) {
-							speak(String.format(
-									"Reverse guard on %s already opened its reverse position. It cannot be removed this way.",
-									selected.getLabel()));
-						}
-						else {
-							op = "reverse_guard";
-							pendingReverseOrder = selected;
-							MyInstrument mi = findMyInstrument(selected.getInstrument());
-							double triggerPercent = mi != null ? mi.rtp : REVERSE_TRIGGER_PERCENT;
-							speak(String.format(
-									"Reverse guard on %s order %s. If it loses %s percent, an opposite position opens. Press space to confirm.",
-									selected.isLong() ? "buy" : "sell",
-									selected.getLabel(),
-									formatPrice(triggerPercent)
-									));
-						}
-					}
-					else {
-						op = "guarantee";
-						pendingGuaranteeOrder = openOrders.get(idx);
-						guaranteeChoice = GUARANTEE_INSTANT;
-						// one speak() per announcement: each call cuts the previous one off
-						speak(String.format(
-								"Profit guarantee for %s order %s. Use up and down to choose. %s",
-								pendingGuaranteeOrder.isLong() ? "buy" : "sell",
-								pendingGuaranteeOrder.getLabel(),
-								guaranteeChoiceText()
-								));
-					}
+					// one menu, three choices, cycled with up/down: instant guarantee, conditional
+					// guarantee, or the reverse guard that used to be Shift+F10's own separate action
+					op = "guarantee";
+					pendingGuaranteeOrder = openOrders.get(idx);
+					guaranteeChoice = GUARANTEE_INSTANT;
+					// one speak() per announcement: each call cuts the previous one off
+					speak(String.format(
+							"Profit guarantee for %s order %s. Use up and down to choose. %s",
+							pendingGuaranteeOrder.isLong() ? "buy" : "sell",
+							pendingGuaranteeOrder.getLabel(),
+							guaranteeChoiceText()
+							));
 					break;
 				}
 				case  KeyEvent.VK_F12:
@@ -989,10 +986,9 @@ class VoiceMenu  implements APICallback{
 
 		}
 		else if (op.equals("gsp")) {
-			// F10 profit guarantee trailing-stop distance. Only takes effect on the next guarantee
-			// armed on this instrument - an already-armed guard keeps trailing at the percent it
-			// was armed with, snapshotted on the ProfitGuarantee itself.
-			double gsp = instruments.get(selectedInstrument).gsp;
+			// F10 profit guarantee trailing-stop distance, global for every instrument. Only takes
+			// effect on the next guarantee armed - an already-armed guard keeps trailing at the
+			// percent it was armed with, snapshotted on the ProfitGuarantee itself.
 			double x = gsp + direction / 10.0;
 			if (x < 5)
 				direction *= 2;
@@ -1002,14 +998,12 @@ class VoiceMenu  implements APICallback{
 				direction *= 2;
 			gsp = Math.round(gsp*10 + direction) / 10.0;
 			gsp = Math.max(1, Math.min(100, gsp));
-			instruments.get(selectedInstrument).gsp = gsp;
 
-			speak(formatPrice(instruments.get(selectedInstrument).gsp));
+			speak(formatPrice(gsp));
 		}
 		else if (op.equals("rtp")) {
-			// Shift+F10 reverse guard trigger percent. Only takes effect on the next guard armed on
-			// this instrument - an already-armed guard keeps the threshold it was armed with.
-			double rtp = instruments.get(selectedInstrument).rtp;
+			// reverse guard trigger percent, global for every instrument. Only takes effect on the
+			// next guard armed - an already-armed guard keeps the threshold it was armed with.
 			double x = rtp + direction / 10.0;
 			if (x < 5)
 				direction *= 2;
@@ -1019,14 +1013,12 @@ class VoiceMenu  implements APICallback{
 				direction *= 2;
 			rtp = Math.round(rtp*10 + direction) / 10.0;
 			rtp = Math.max(1, Math.min(100, rtp));
-			instruments.get(selectedInstrument).rtp = rtp;
 
-			speak(formatPrice(instruments.get(selectedInstrument).rtp));
+			speak(formatPrice(rtp));
 		}
 		else if (op.equals("rlp")) {
-			// Shift+F10 reverse guard lock percent, both sides' stop/target once hedged. Only takes
-			// effect on the next guard armed on this instrument, same as the trigger percent above.
-			double rlp = instruments.get(selectedInstrument).rlp;
+			// reverse guard lock percent, both sides' stop/target once hedged, global for every
+			// instrument. Only takes effect on the next guard armed, same as the trigger percent above.
 			double x = rlp + direction / 10.0;
 			if (x < 5)
 				direction *= 2;
@@ -1036,9 +1028,8 @@ class VoiceMenu  implements APICallback{
 				direction *= 2;
 			rlp = Math.round(rlp*10 + direction) / 10.0;
 			rlp = Math.max(1, Math.min(100, rlp));
-			instruments.get(selectedInstrument).rlp = rlp;
 
-			speak(formatPrice(instruments.get(selectedInstrument).rlp));
+			speak(formatPrice(rlp));
 		}
 		else if (op.equals("quantity")) {
 			MyInstrument instrument = instruments.get(selectedInstrument);
@@ -1111,7 +1102,7 @@ class VoiceMenu  implements APICallback{
 					(order.isLong()) ? "buy" : "sell",
 							Math.round(order.getAmount() * 1000000),
 							order.getInstrument().getName(),
-							formatPrice(order.getOpenPrice()),
+							formatPrice(order.getOpenPrice(), !shift, findMyInstrument(order.getInstrument())),
 							MyUtils.formatTime(order.getCreationTime())
 					));
 
@@ -1153,12 +1144,12 @@ class VoiceMenu  implements APICallback{
 			int last = Math.max(0, dayBarCount() - 1);
 			dayOffset = Math.max(0, Math.min(last, dayOffset - direction));
 			currentDayStats = computeDayStats(dayOffset);
-			speakDayStats(currentDayStats);
+			speakDayStats(currentDayStats, !shift);
 		}
 		else if (op.equals("guarantee")) {
-			// two entries, and the cursor keys hand us steps of 1, 10 or a billion
+			// three entries, and the cursor keys hand us steps of 1, 10 or a billion
 			guaranteeChoice += Integer.signum(direction);
-			guaranteeChoice = Math.max(GUARANTEE_INSTANT, Math.min(GUARANTEE_CONDITIONAL, guaranteeChoice));
+			guaranteeChoice = Math.max(GUARANTEE_INSTANT, Math.min(GUARANTEE_REVERSE, guaranteeChoice));
 			speak(guaranteeChoiceText());
 		}
 		else if (op.equals("messages")) {
@@ -1216,15 +1207,12 @@ class VoiceMenu  implements APICallback{
 		speak(String.format("Take profit %s%%", formatPrice(tpp)));
 	}
 	private void reportGSP() {
-		double gsp = instruments.get(selectedInstrument).gsp;
 		speak(String.format("Guarantee trail %s%%", formatPrice(gsp)));
 	}
 	private void reportRTP() {
-		double rtp = instruments.get(selectedInstrument).rtp;
 		speak(String.format("Reverse trigger %s%%", formatPrice(rtp)));
 	}
 	private void reportRLP() {
-		double rlp = instruments.get(selectedInstrument).rlp;
 		speak(String.format("Reverse lock %s%%", formatPrice(rlp)));
 	}
 	private void reportQuantity() {
@@ -1362,21 +1350,28 @@ class VoiceMenu  implements APICallback{
 		else if (op.equals("guarantee")) {
 			if (pendingGuaranteeOrder == null)
 				return;
-			armProfitGuarantee(pendingGuaranteeOrder, guaranteeChoice);
-		}
-		else if (op.equals("reverse_guard")) {
-			if (pendingReverseOrder == null)
-				return;
-			armReverseGuard(pendingReverseOrder);
-		}
-		else if (op.equals("reverse_remove")) {
-			if (pendingReverseOrder == null)
-				return;
-			String label = pendingReverseOrder.getLabel();
-			// re-check hedged here too: the guard could have fired between the key press and this
-			// confirm, and a hedged guard is not removable this way
-			boolean removed = reverseGuards.removeIf(g -> g.original.getLabel().equals(label) && !g.hedged);
-			speak(removed ? "Reverse guard removed from " + label + "." : "Nothing to remove.");
+			if (guaranteeChoice == GUARANTEE_REVERSE) {
+				String label = pendingGuaranteeOrder.getLabel();
+				ReverseGuard existing = findReverseGuard(label);
+				if (existing != null && !existing.hedged) {
+					// removal only makes sense before the reverse position exists - once hedged, taking
+					// the guard away leaves a pair of live positions with nothing watching them. Re-check
+					// hedged here too: the guard could have fired between the key press and this confirm.
+					reverseGuards.remove(existing);
+					speak("Reverse guard removed from " + label + ".");
+				}
+				else if (existing != null) {
+					speak(String.format(
+							"Reverse guard on %s already opened its reverse position. It cannot be removed this way.",
+							label));
+				}
+				else {
+					armReverseGuard(pendingGuaranteeOrder);
+				}
+			}
+			else {
+				armProfitGuarantee(pendingGuaranteeOrder, guaranteeChoice);
+			}
 		}
 
 	}
@@ -1599,6 +1594,8 @@ class VoiceMenu  implements APICallback{
 		Instrument instrument = instruments.get(selectedInstrument).getInstrument();
 		if (dayBars != null && instrument.equals(dayBarsInstrument))
 			return dayBars;
+		if (MyStrategy.getContext() == null)
+			return null;
 		IHistory history = MyStrategy.getContext().getHistory();
 		try {
 			// counting candles back from the last one sidesteps day boundaries altogether: a daily
@@ -1662,6 +1659,8 @@ class VoiceMenu  implements APICallback{
 		if (stats.intradayLoaded || !stats.hasData)
 			return;
 		stats.intradayLoaded = true; // one attempt per day, whether or not it finds anything
+		if (MyStrategy.getContext() == null)
+			return; // not connected right now; the price was already announced, just without a time
 		Instrument instrument = instruments.get(selectedInstrument).getInstrument();
 		IHistory history = MyStrategy.getContext().getHistory();
 		try {
@@ -1696,7 +1695,7 @@ class VoiceMenu  implements APICallback{
 		}
 	}
 
-	private void speakDayStats(DayStats stats) {
+	private void speakDayStats(DayStats stats, boolean shorter) {
 		MyInstrument mi = instruments.get(selectedInstrument);
 		if (!stats.hasData) {
 			speak(stats.dayName + ". No data.");
@@ -1706,17 +1705,17 @@ class VoiceMenu  implements APICallback{
 		speak(String.format(
 				"%s. Min: %s. Max: %s.",
 				stats.dayName,
-				formatPrice(stats.minPrice, false, mi),
-				formatPrice(stats.maxPrice, false, mi)
+				formatPrice(stats.minPrice, shorter, mi),
+				formatPrice(stats.maxPrice, shorter, mi)
 				));
 	}
 
 	private void reportDay() {
 		currentDayStats = computeDayStats(dayOffset);
-		speakDayStats(currentDayStats);
+		speakDayStats(currentDayStats, true);
 	}
 
-	private void speakDayMin() {
+	private void speakDayMin(boolean shorter) {
 		if (currentDayStats == null || !currentDayStats.hasData) {
 			speak("No data");
 			return;
@@ -1724,11 +1723,11 @@ class VoiceMenu  implements APICallback{
 		MyInstrument mi = instruments.get(selectedInstrument);
 		loadIntradayTimes(currentDayStats);
 		speak(String.format("Min: %s%s",
-				formatPrice(currentDayStats.minPrice, false, mi),
+				formatPrice(currentDayStats.minPrice, shorter, mi),
 				timeSuffix(currentDayStats.minTime)));
 	}
 
-	private void speakDayMax() {
+	private void speakDayMax(boolean shorter) {
 		if (currentDayStats == null || !currentDayStats.hasData) {
 			speak("No data");
 			return;
@@ -1736,7 +1735,7 @@ class VoiceMenu  implements APICallback{
 		MyInstrument mi = instruments.get(selectedInstrument);
 		loadIntradayTimes(currentDayStats);
 		speak(String.format("Max: %s%s",
-				formatPrice(currentDayStats.maxPrice, false, mi),
+				formatPrice(currentDayStats.maxPrice, shorter, mi),
 				timeSuffix(currentDayStats.maxTime)));
 	}
 
@@ -1884,20 +1883,22 @@ class VoiceMenu  implements APICallback{
 
 
 	}
-	private void adjustOpenPrice(int direction) {
+	private void adjustOpenPrice(int direction, boolean shorter) {
 
-		double pip = instruments.get(selectedInstrument).instrument.getPipValue();
+		MyInstrument instrument = instruments.get(selectedInstrument);
+		double pip = instrument.instrument.getPipValue();
 		openPrice = openPrice * (1 + direction * 0.0002);
 		openPrice  = Math.round(openPrice  /pip)*pip;
 		// remove trailing zeros which sometime apears
 		openPrice   = Math.round(openPrice * 1000000) / 1000000.0;
 		System.out.println(openPrice);
 
+		String formatted = formatPrice(openPrice, shorter, instrument);
 		if (openType == TYPE_HEDGE) {
-			speak("Hedging at " + openPrice);
+			speak("Hedging at " + formatted);
 		}
 		else {
-			speak("Target price " + openPrice + ". Press up for buy, down for sell.");
+			speak("Target price " + formatted + ". Press up for buy, down for sell.");
 		}
 	}
 
@@ -1911,7 +1912,7 @@ class VoiceMenu  implements APICallback{
 		return Math.round(value * magnitude) / magnitude;
 	}
 
-	private void adjustUpdateTarget(int direction) {
+	private void adjustUpdateTarget(int direction, boolean shorter) {
 		updateTargetLevel += direction;
 		if (updateTargetLevel == 0) {
 			speak("Now");
@@ -1925,7 +1926,8 @@ class VoiceMenu  implements APICallback{
 		else
 			target = updateInitTick.getBid() + updateTargetLevel * step;
 		updateTargetPrice = roundToSignificantDigits(target, 5);
-		speak("Target: " + formatPrice(updateTargetPrice));
+		MyInstrument mi = pendingUpdateOrder != null ? findMyInstrument(pendingUpdateOrder.getInstrument()) : null;
+		speak("Target: " + formatPrice(updateTargetPrice, shorter, mi));
 	}
 
 	// called from MyStrategy.onTick for every tick; delegates to the singleton instance
@@ -1943,20 +1945,19 @@ class VoiceMenu  implements APICallback{
 		return Math.round(rounded * 1000000) / 1000000.0;
 	}
 
-	// Shift+F10: watches one position and, the first time it is more than the trigger percent under
-	// water, opens the opposite position of the same size. Fires once and once only - after that the
-	// guard exists just to set the surviving side's stop when the other one goes. Callers are
-	// expected to have already checked for an existing guard on this order (see the VK_F10 handler),
-	// since re-arming one is handled separately, by replacing it or offering to remove it.
+	// F10's reverse guard choice: watches one position and, the first time it is more than the
+	// trigger percent under water, opens the opposite position of the same size. Fires once and once
+	// only - after that the guard exists just to set the surviving side's stop when the other one
+	// goes. Callers are expected to have already checked for an existing guard on this order (see the
+	// VK_F10 handler), since re-arming one is handled separately, by replacing it or offering to remove it.
 	private void armReverseGuard(IOrder order) {
 		if (MyStrategy.getContext() == null) {
 			speak("Please wait");
 			return;
 		}
 		String label = order.getLabel();
-		MyInstrument mi = findMyInstrument(order.getInstrument());
-		double triggerPercent = mi != null ? mi.rtp : REVERSE_TRIGGER_PERCENT;
-		double lockPercent = mi != null ? mi.rlp : REVERSE_LOCK_PERCENT;
+		double triggerPercent = rtp;
+		double lockPercent = rlp;
 		// the distance to halve later is the one the position has now, before the guard moves anything
 		double stopLoss = order.getStopLossPrice();
 		double stopDistance = (stopLoss > 0) ? Math.abs(order.getOpenPrice() - stopLoss) : 0;
@@ -1985,11 +1986,14 @@ class VoiceMenu  implements APICallback{
 				continue;
 
 			if (!g.hedged) {
-				if (g.original.getState() != IOrder.State.FILLED) {
-					// closed before it ever went far enough; nothing to guard
+				IOrder.State originalState = g.original.getState();
+				if (originalState == IOrder.State.CLOSED || originalState == IOrder.State.CANCELED) {
+					// closed or canceled before it ever went far enough; nothing to guard
 					reverseGuards.remove(g);
 					continue;
 				}
+				if (originalState != IOrder.State.FILLED)
+					continue; // still a pending conditional order; wait for it to fill before watching it
 				// a long is marked against the bid and a short against the ask
 				double exit = g.original.isLong() ? tick.getBid() : tick.getAsk();
 				double adverse = g.original.isLong()
@@ -2032,13 +2036,21 @@ class VoiceMenu  implements APICallback{
 	}
 
 	private String guaranteeChoiceText() {
-		MyInstrument mi = findMyInstrument(pendingGuaranteeOrder.getInstrument());
-		String percent = formatPrice(mi != null ? mi.gsp : GUARANTEE_SL_PERCENT);
 		if (guaranteeChoice == GUARANTEE_INSTANT)
 			return String.format(
 					"Instant guarantee: stop loss at %s percent, following the price. Press enter to confirm.",
-					percent);
-		return "Conditional guarantee: wait for the take profit price, then follow the price. Press enter to confirm.";
+					formatPrice(gsp));
+		if (guaranteeChoice == GUARANTEE_CONDITIONAL)
+			return "Conditional guarantee: wait for the take profit price, then follow the price. Press enter to confirm.";
+
+		ReverseGuard existing = findReverseGuard(pendingGuaranteeOrder.getLabel());
+		if (existing != null && !existing.hedged)
+			return "Reverse guard already set. Press enter to remove it.";
+		if (existing != null)
+			return "Reverse guard already opened its reverse position. It cannot be removed this way.";
+		return String.format(
+				"Reverse guard: if it loses %s percent, an opposite position opens. Press enter to confirm.",
+				formatPrice(rtp));
 	}
 
 	// a level 'percent' away from the current price, on the profitable or the losing side of the
@@ -2064,8 +2076,7 @@ class VoiceMenu  implements APICallback{
 			return;
 		}
 		String label = order.getLabel();
-		MyInstrument mi = findMyInstrument(order.getInstrument());
-		double slPercent = mi != null ? mi.gsp : GUARANTEE_SL_PERCENT;
+		double slPercent = gsp;
 
 		// already guarded: re-arming replaces only the trailing-stop percent on the existing guard -
 		// not its stop price, not its trailing/conditional state. A fresh arm from scratch would
@@ -2119,11 +2130,14 @@ class VoiceMenu  implements APICallback{
 		for (ProfitGuarantee g : profitGuarantees) {
 			if (!g.order.getInstrument().equals(instrument))
 				continue;
-			if (g.order.getState() != IOrder.State.FILLED) {
+			IOrder.State orderState = g.order.getState();
+			if (orderState == IOrder.State.CLOSED || orderState == IOrder.State.CANCELED) {
 				// the stop was hit, or the position was closed by hand
 				profitGuarantees.remove(g);
 				continue;
 			}
+			if (orderState != IOrder.State.FILLED)
+				continue; // still a pending conditional order; nothing to trail until it fills
 			if (g.inFlight || System.currentTimeMillis() < g.retryAfter)
 				continue;
 
